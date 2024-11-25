@@ -4,7 +4,7 @@ install()
 #---------------------------------------------------------------------------------------------------
 
 from dataclasses import dataclass
-from torch import nn
+from torch import logit, nn
 from torch.nn import functional as F
 import torch
 import math
@@ -191,9 +191,38 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
   
   
 # --------------------------------------------------------------------------------------------------
+num_return_sequences = 5
+max_length = 30
+
 model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
-    
-    
+model.eval()  # 从上面定义来看，没有任何层是training不同于testing的；也许torch会做些聪明的事情:)
+model.to('cuda')
         
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model, ")
+tokens = torch.tensor(tokens, dtype=torch.long)  # long=int64; (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
+x = tokens.to('cuda')
+
+# 生成，(B, T) ==> (5, 8)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+  # forward the model to get logits
+  with torch.no_grad():
+    logits = model(x) # (B, T, vocab_size)
+    logits = logits[:, -1, :] # (B, vocab_size)
+    probs = F.softmax(logits, dim=-1)  #? 为什么取T上的最后一个？不应该在vocab_size上做softmax吗？
+    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    ix = torch.multinomial(topk_probs, 1)
+    xcol = torch.gather(topk_indices, -1, ix)
+    x = torch.cat((x, xcol), dim=1)
+
+# 输出生成文本
+for i in range(num_return_sequences):
+  tokens = x[i, :max_length].tolist()
+  decoded = enc.decode(tokens)
+  print(">", decoded)
+    
     
