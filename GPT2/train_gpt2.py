@@ -115,8 +115,8 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
     self.config = config
     
     self.transformer = nn.ModuleDict(dict( # 无序存储一些用到的module
-      wte=nn.Embedding(config.vocab_size, config.n_embd), # token嵌入查找表
-      wpe=nn.Embedding(config.block_size, config.n_embd), # pos嵌入查找表
+      wte=nn.Embedding(config.vocab_size, config.n_embd), # token嵌入查找表,长度为词表长度
+      wpe=nn.Embedding(config.block_size, config.n_embd), # pos嵌入查找表, 长度为输入序列的长度
       h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  
       ln_f=nn.LayerNorm(config.n_embd),
     ))
@@ -124,6 +124,27 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
     # 去掉偏置项可以简化模型，减少参数量，而且对性能影响不大。
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
   
+  def forward(self, idx: torch.Tensor):
+    """idx.shape=(B,T)"""
+    B, T = idx.size()
+    assert T <= self.config.block_size, \
+      f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+    # forward the token and pos embedding
+    pos = torch.arange(0, T, dtype=torch.long, device = idx.device)
+    pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+    tok_emb = self.transformer.wte(idx) # (B, T, n_embd) 按 idx[i][j] 的值，取Embed表的对应行-(,n_embd)
+    x = tok_emb + pos_emb # 隐式广播，在Batch维度上，pos_emb(T, n_embd)->(B, T, n_embd), 
+    # forward the blocks of transformer
+    for block in self.transformer.h:
+      x = block(x)
+    # forward the final layernorm and the classisfier
+    x = self.transformer.ln_f(x)
+    logits = self.lm_head(x)   # (B, T, vocab_size)
+    
+    #@ 最后结果(B, T, vocab_size)：对于T个过去的token，预测下一个token在vocab中的概率分布，size=vocab_size。
+    # 通过argmax(logits, dim=-1)就可以得到预测的下一个token
+    return logits
+    
   @classmethod # 类方法，无须实例化。第一个cls表示类本身。
   def from_pretrained(cls, model_type):
     """从huggingface加载预训练gpt2模型"""
