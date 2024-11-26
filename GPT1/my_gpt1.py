@@ -55,7 +55,6 @@ def get_batch(split:str):
 
 
 
-
 @torch.no_grad()
 def estimate_loss():
   out = {}
@@ -100,13 +99,18 @@ class Head(nn.Module):
     return output
   
   
-    
-    
-    
+class MultiHeadAttention(nn.Module):
+  """多头自注意力，每个注意力头并行"""
+  def __init__(self, num_heads, head_size):
+    super().__init__()
+    self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+    self.proj = nn.Linear(head_size * num_heads, n_embd)
+    self.dropout = nn.Dropout(dropout)
   
-  
-# class MultiHeadAttention(nn.Module):
-#   """多头自注意力，每个注意力头并行"""
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.dropout(self.proj(out))
+    return out
     
     
   
