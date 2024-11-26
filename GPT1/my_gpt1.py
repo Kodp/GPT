@@ -19,7 +19,6 @@ device        = f'cuda:{gpu_index}' if torch.cuda.is_available() else 'cpu'
 
 torch.manual_seed(1337)
 
-
 #@ 数据集
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -33,4 +32,83 @@ itos = { i:ch for i,ch in enumerate(chars) }
 
 encode = lambda text_seq: [stoi[c] for c in text_seq]
 decode = lambda idx_seq: ''.join([itos[i] for i in idx_seq])
+
+
+#@ 划分集合, 读取数据
+data = torch.tensor(encode(text), type=torch.long)
+n = int(0.9 * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+
+model = None
+
+def get_batch(split:str):
+  """返回一批数据。split:指示训练集或测试集"""
+  data = train_data if split == 'train' else val_data
+  # 从data中随机采样batch_size个值，每个值的范围在[0, len(data) - block_size)，保证不越界
+  start_ix = torch.randint(len(data) - context_len, (batch_size, ))  # (a, ) 表示元组，参数要求元组
+  x  = torch.stack([data[i:i+context_len]] for i in start_ix)
+  y  = torch.stack([data[i+1:i+context_len+1]] for i in start_ix)
+  x, y = x.to(device), y.to(device)
+  return x, y
+
+
+
+
+@torch.no_grad()
+def estimate_loss():
+  out = {}
+  model.eval()
+
+  for split in ['train', 'eval']:
+    losses = torch.zeros(eval_iters)
+    for k in range(eval_iters):
+      X, Y = get_batch(split)
+      logits, loss = model(X, Y)
+      losses[k] = loss.item()
+    out[split] = losses.mean()
+  
+  model.train()
+  return out
+
+class Head(nn.Module):
+  """单头自注意力"""
+  def __init__(self, head_size):
+    super().__init__()
+    self.key = nn.Linear(n_embd, head_size, bias=False)
+    self.query = nn.Linear(n_embd, head_size, bias=False)
+    self.value = nn.Linear(n_embd, head_size, bias=False)
+    # `tril` 下三角全为1，其余为0，用于确保模型只基于过去的token预测下一个token；buffer张量不参与梯度计算；
+    self.register_buffer('tril', torch.tril(torch.ones(context_len, context_len))) 
+    self.dropout = nn.Dropout(dropout)
+  
+  def forward(self, x):
+    """x.shape:(Batch, Time-step, Channel); output.shape:(Batch, Time-step, Channel)"""
+    B, T, C = x.shape  # T <= context_len
+    k = self.key(x)    # (B,T,hs)  「hs=head size」
+    q = self.query(x)  # (B,T,hs)
+    # (B,T,hs) @ (B,hs,T) -> (B,T,T)
+    s = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
+    s = s.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
+    
+    a = F.softmax(s, dim=-1)  # (B,T,T)
+    a = self.dropout(a)       # 防止叠加多层过拟合
+    v = self.value(x)
+    output = a @ v               # (B,T,T) @ (B,T,hs) -> (B,T,hs)
+    
+    return output
+  
+  
+    
+    
+    
+  
+  
+# class MultiHeadAttention(nn.Module):
+#   """多头自注意力，每个注意力头并行"""
+    
+    
+  
+  
 
