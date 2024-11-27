@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
 # 美化错误输出 --------------------------------------------------------------------------------------
 from rich.traceback import install
 install()
@@ -36,6 +35,8 @@ vocab_size = len(chars)
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 
+print("vocab size:", vocab_size)
+
 encode = lambda text_seq: [stoi[c] for c in text_seq]
 decode = lambda idx_seq: ''.join([itos[i] for i in idx_seq])
 
@@ -54,19 +55,19 @@ def get_batch(split:str):
   data = train_data if split == 'train' else val_data
   # 从data中随机采样batch_size个值，每个值的范围在[0, len(data) - block_size)，保证不越界
   start_ix = torch.randint(len(data) - max_context_len, (batch_size, ))  # (a, ) 表示元组，参数要求元组
-  x  = torch.stack([data[i:i+max_context_len]] for i in start_ix)
-  y  = torch.stack([data[i+1:i+max_context_len+1]] for i in start_ix)
+  x  = torch.stack([data[i:i+max_context_len] for i in start_ix])     # (B, max_context_len)
+  y  = torch.stack([data[i+1:i+max_context_len+1] for i in start_ix]) # (B, max_context_len)
   x, y = x.to(device), y.to(device)
   return x, y
 
 
-
+#@ 评估损失
 @torch.no_grad()
 def estimate_loss():
   out = {}
   model.eval()
 
-  for split in ['train', 'eval']:
+  for split in ['train', 'val']:
     losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
       X, Y = get_batch(split)
@@ -77,6 +78,7 @@ def estimate_loss():
   model.train()
   return out
 
+#@ 模型
 class Head(nn.Module):
   """单头自注意力"""
   def __init__(self, head_size):
@@ -181,7 +183,7 @@ class GPTLanguageModel(nn.Module):
     """idx.shape=(Batch size, Time-step),值为token"""
     B, T = idx.shape
     tok_emb = self.token_embedding_table(idx) # 得到token的嵌入 (B,T,C)
-    pos_emb = self.token_embedding_table(torch.arange(T, device=device)) # (T,C)
+    pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
     x       = tok_emb + pos_emb  # (B,T,C)
     x       = self.blocks(x)     # (B,T,C)
     x       = self.ln_f(x)       # (B,T,C)
@@ -208,12 +210,36 @@ class GPTLanguageModel(nn.Module):
       logits   = logits[:, -1, :]  # (B,C)
       probs    = F.softmax(logits, dim=-1) # (B,C)
       # 从预测的分布中采样一个token的idx
-      idx_next = torch.multinomial(probs, num_sample=1) # (B,1)
+      idx_next = torch.multinomial(probs, num_samples=1) # (B,1)
       # 添加一个idx到上下文索引idx
-      idx      = torch.cat((idx, idx_next))  # (B,T+1)
+      idx      = torch.cat((idx, idx_next), dim=1)  # (B,T+1) !注意这里是在时间维度上拼接,而不是在batch维度上拼接
 
     return idx
 
 
+#@ 训练+输出
 model = GPTLanguageModel()
 m = model.to(device)
+# 输出模型参数量
+print(sum(p.numel() for p in m.parameters()) / 1e6, "M parameters")
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# 提示开始训练
+print("Start training...") 
+for iter in range(max_iters):
+  if iter % eval_interval == 0 or iter == max_iters - 1:
+    losses = estimate_loss()
+    print(f"Step {iter}: train loss {losses['train']:4f}, val loss {losses['val']:.4f}")
+    
+  xb, yb = get_batch('train')
+  logits, loss = model(xb, yb)
+  optimizer.zero_grad(set_to_none=True)
+  loss.backward()
+  optimizer.step()
+  
+
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+  
