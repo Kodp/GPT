@@ -88,6 +88,7 @@ class Head(nn.Module):
     self.value = nn.Linear(N_EMBD, head_size, bias=False)
     # `tril` 下三角全为1，其余为0，用于确保模型只基于过去的token预测下一个token；buffer张量不参与梯度计算；
     self.register_buffer('tril', torch.tril(torch.ones(MAX_CONTEXT_LEN, MAX_CONTEXT_LEN))) 
+    #$ tril矩阵在每个HEAD里都有一个拷贝，导致内存浪费。可以放到MultiHeadAttention或GPTLanguageModel里。
     self.dropout = nn.Dropout(DROPOUT)
   
   def forward(self, x):
