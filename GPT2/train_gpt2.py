@@ -3,12 +3,30 @@ from rich.traceback import install
 install()
 #---------------------------------------------------------------------------------------------------
 
+# timer 装饰器 --------------------------------------------------------------------------------------
+def timing_decorator(func):
+  import time
+  from functools import wraps  # 导入 wraps 装饰器
+  @wraps(func)  # 使用 wraps 装饰器来保留原始函数的元数据
+  def wrapper(*args, **kwargs):
+    start_time = time.time()  # 记录开始时间
+    result = func(*args, **kwargs)  # 执行被装饰的函数
+    end_time = time.time()  # 记录结束时间
+    execution_time = end_time - start_time  # 计算执行时间
+    BOLD, RESET, lightred = '\033[1m', '\033[0m', '\033[91m'  # ANSI 转义码来设置文本颜色
+    # 打印带有颜色和样式的运行时间
+    print(f"{lightred}{BOLD}[INFO] {func.__name__} executed in {execution_time:.4f}s{RESET} ")
+    return result
+  return wrapper
+# --------------------------------------------------------------------------------------------------
+
 from dataclasses import dataclass
 from torch import logit, nn
 from torch.nn import functional as F
 import torch
 import math
 
+# 配置文件
 @dataclass
 class GPTConfig:
   block_size: int = 1024   # 语言模型的输入序列长度
@@ -18,65 +36,45 @@ class GPTConfig:
   n_embd    : int = 768    # Embedding维度
 
 
-#@ 所有变量名和transformers的GPT2模型一致，才能加载它的预训练模型
-"""
-transformer.wte.weight torch.Size([50257, 768])
-transformer.wpe.weight torch.Size([1024, 768])
-transformer.h.0.ln_1.weight torch.Size([768])
-transformer.h.0.ln_1.bias torch.Size([768])
-transformer.h.0.attn.c_attn.weight torch.Size([768, 2304])
-transformer.h.0.attn.c_attn.bias torch.Size([2304])
-transformer.h.0.attn.c_proj.weight torch.Size([768, 768])
-transformer.h.0.attn.c_proj.bias torch.Size([768])
-transformer.h.0.ln_2.weight torch.Size([768])
-transformer.h.0.ln_2.bias torch.Size([768])
-transformer.h.0.mlp.c_fc.weight torch.Size([768, 3072])
-transformer.h.0.mlp.c_fc.bias torch.Size([3072])
-transformer.h.0.mlp.c_proj.weight torch.Size([3072, 768])
-transformer.h.0.mlp.c_proj.bias torch.Size([768])
-transformer.h.1.ln_1.weight torch.Size([768])
-transformer.h.1.ln_1.bias torch.Size([768])
-...
-transformer.h.11.mlp.c_proj.bias torch.Size([768])
-transformer.ln_f.weight torch.Size([768])
-transformer.ln_f.bias torch.Size([768])
-lm_head.weight torch.Size([50257, 768])
-"""
+#@ 多头自注意力层
 class CausalSelfAttention(nn.Module):
   def __init__(self, config: GPTConfig):
     super().__init__()
-    #@ 在实现多头自注意力机制时，嵌入维度需要被平均分割给每个注意力头
+    # 保证多头输出cat后维度为n_embd（当然也可以不对齐，proj改一下输入维度=头数*head_size)
     assert config.n_embd % config.n_head == 0  
-    self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+    self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)  #(C,3C) W_q, W_k, W_v, 水平拼接
     self.c_proj = nn.Linear(config.n_embd, config.n_embd)
     self.n_head = config.n_head
     self.n_embd = config.n_embd
 
-    #@ register_buffer 注册一个缓冲区张量——不参与梯度计算，也不更新。
+    # register_buffer 注册一个缓冲区张量——不参与梯度计算，也不更新。
     # torch.tril 生成下三角矩阵
     self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)) \
-      .view(1, 1, config.block_size, config.block_size)) 
+      .view(1, 1, config.block_size, config.block_size))   # (1, 1, block_size, block_size)
     """
-    bias = tensor(
-       [[[[1., 0., 0., 0.],
-          [1., 1., 0., 0.],
-          [1., 1., 1., 0.],
-          [1., 1., 1., 1.]]]])
+    bias = tensor([[[[1., 0., 0., 0.],
+                     [1., 1., 0., 0.],
+                     [1., 1., 1., 0.],
+                     [1., 1., 1., 1.]]]])
     """
       
   def forward(self, x):
+    """前向传播
+    nh = number of heads, hs = head size, T = Time-step/sequence length, C=hidden size
+    """
     B, T, C = x.size()
-    qkv:torch.Tensor  = self.c_attn(x)
-    q, k, v= qkv.split(self.n_embd, dim=2)
-    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    qkv:torch.Tensor  = self.c_attn(x) # (B,T,C)@(C,3C)->(B,T,3C)
+    q, k, v = qkv.split(self.n_embd, dim=2) # 3 x (B,T,C)
+    #todo 需要自己实现一个tensor类、支持这种功能，才能真正理解数据是怎么变换的。
     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-    att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))
-    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) #? 做什么
-    att = F.softmax(att, dim=-1)
-    y   = att @ v
-    y   = y.transpose(1, 2).contiguous().view(B, T, C)
+    att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))) # (B, nh, T, T)
+    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # 防止偷看未来的token
+    att = F.softmax(att, dim=-1) # (B, nh, T, T)
+    y   = att @ v # (B,nh,T,T)@(B,nh,T,hs)->(B,nh,T,hs)
+    y   = y.transpose(1, 2).contiguous().view(B, T, C)  
     
     y = self.c_proj(y)
     return y
@@ -130,7 +128,7 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
     assert T <= self.config.block_size, \
       f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
     # forward the token and pos embedding
-    pos = torch.arange(0, T, dtype=torch.long, device = idx.device)
+    pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
     pos_emb = self.transformer.wpe(pos) # (T, n_embd)
     tok_emb = self.transformer.wte(idx) # (B, T, n_embd) 按 idx[i][j] 的值，取Embed表的对应行-(,n_embd)
     x = tok_emb + pos_emb # 隐式广播，在Batch维度上，pos_emb(T, n_embd)->(B, T, n_embd), 
@@ -197,10 +195,11 @@ max_length = 30
 model = GPT.from_pretrained('gpt2')
 model.eval()  # 从上面定义来看，没有任何层是training不同于testing的；也许torch会做些聪明的事情:)
 model.to('cuda')
-        
+print("model loaded to cuda")
+
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model, ")
+tokens = enc.encode("Hello, I'm a language model,")  # 最后加空格，输出会混乱，原因主要出在token上
 tokens = torch.tensor(tokens, dtype=torch.long)  # long=int64; (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
 x = tokens.to('cuda')
@@ -213,7 +212,7 @@ while x.size(1) < max_length:
   with torch.no_grad():
     logits = model(x) # (B, T, vocab_size)
     logits = logits[:, -1, :] # (B, vocab_size)
-    probs = F.softmax(logits, dim=-1)  #? 为什么取T上的最后一个？不应该在vocab_size上做softmax吗？
+    probs = F.softmax(logits, dim=-1)  
     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
     ix = torch.multinomial(topk_probs, 1)
     xcol = torch.gather(topk_indices, -1, ix)
