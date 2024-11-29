@@ -127,6 +127,13 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
     # 去掉偏置项可以简化模型，减少参数量，而且对性能影响不大。
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
   
+    # weight sharing scheme 共享softmax之前的线性层和embedding层权重
+    self.transformer.wte.weight = self.lm_head.weight  # 原来的wte.weight会变成孤立状态，从而被回收
+    
+    # self.apply(self._init_weights)
+  
+    
+  
   def forward(self, idx: torch.Tensor):
     """idx.shape=(B,T)"""
     B, T = idx.size()
