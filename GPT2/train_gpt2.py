@@ -392,6 +392,7 @@ if master_process:
   print(f"total desired batch size: {total_batch_size}")
   print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
+#@ 设置loader
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
                               split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
@@ -442,6 +443,158 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f:  # 只是为了清空文件
   pass
 
+#@ 开始训练
+#! 需细细的处理分析，这里目前只是敲了一遍
+for step in range(max_steps):
+  t0 = time.time()
+  last_step = (step == max_steps - 1)
+  
+  #@ 定期评估验证损失
+  if step % 250 == 0 or last_step:
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+      val_loss_accum = 0.0
+      val_loss_steps = 20 # 每次计算损失时的步数
+      for _ in range(val_loss_steps):
+        x, y = val_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16): # 自动混合精度
+          logits, loss = model(x, y)
+        loss = loss / val_loss_steps  # 平均损失
+        val_loss_accum += loss.detach()
+    ## 如果是分布式训练，执行所有进程之间的平均
+    if ddp:
+      dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    ##@ 主进程输出log，保存模型
+    if master_process:
+      print(f"validation loss: {val_loss_accum.item():.4f}")
+      with open(log_file, "a") as f:
+        f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+      ### 保存checkpoint
+      if step > 0 and (step % 5000 == 0 or last_step):
+        checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+        checkpoint = {
+          'model': raw_model.state_dict(),
+          'config': raw_model.config,
+          'step': step,
+          'val_loss': val_loss_accum.item(),
+        }
+        torch.save(checkpoint, checkpoint_path)  #? torch保存了一个python字典？save功能和特性？
+  
+  #@ 定期评估HellaSwag任务
+  if (step % 250 == 0 or last_step) and (not use_compile):
+    num_correct_norm = 0 # 正确的预测数
+    num_total = 0        # 总的预测数
+    for i, example in enumerate(iterate_examples("val")):
+      if i % ddp_world_size != ddp_rank:
+        continue
+      _, tokens, mask, label = render_example(example)  # 生成-模型需要的输入
+      tokens = tokens.to(device)
+      mask = mask.to(device)
+      with torch.no_grad():
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16): #? 具体做了什么？
+          logits, loss = model(tokens)  # 获取模型输出
+        pred_norm = get_most_likely_row(tokens, mask, logits)
+      num_total += 1
+      num_correct_norm += int(pred_norm == label) # 统计正确的预测
+    ## 如果是分布式训练，汇总所有进程的统计数据
+    if ddp:
+      num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+      num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+      #* 因为还没做csapp倒数第二个lab，所以不懂并行是怎么弄的 
+      dist.all_reduce(num_total, op=dist.ReduceOp.SUM) 
+      dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+      num_total = num_total.item()
+      num_correct_norm = num_correct_norm.item()
+    acc_norm = num_correct_norm / num_total
+    if master_process:
+      print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+      with open(log_file, "a") as f:
+        f.write(f"{step} hella {acc_norm:.4f}\n")
+  
+  #@ 定期生成模型输出（排除第一次）
+  if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile): #? compile怎么就不行了
+    model.eval()
+    num_return_sequences = 4  # 生成序列数
+    max_length = 32           # 生成序列长度
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_r_s, t)
+    xgen = tokens.to(device)
+    sample_rng = torch.Generator(device=device)  # 随机数生成器
+    sample_rng.manual_seed(42 + ddp_rank)
+    ## 生成的tokens长度小于最大长度就持续生成
+    while xgen.size(1) < max_length:
+      with torch.no_grad():
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+          logits, loss = model(xgen)
+      logits = logits[:, -1, :]  # 对最后一个token的预测分布
+      probs = F.softmax(logits, dim=-1)
+      topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)   #? 为什么不直接采样
+      ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # 从topk中采样一个
+      xcol = torch.gather(topk_indices, -1, ix)  #? 获取选择的token
+      xgen = torch.cat((xgen, xcol), dim=1)  # 添加新token到序列
+    ## 打印生成的文本
+    for i in range(num_return_sequences):
+      tokens = xgen[i, :max_length].tolist()  #? :max_length多此一举？
+      decoded = enc.decode(tokens)
+      print(f"rank {ddp_rank} sample {i}: {decoded}")
+    
+  #@ 优化
+  model.train()
+  optimizer.zero_grad()
+  loss_accum = 0.0
+  for micro_step in range(grad_accum_steps):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    if ddp: # 如果是分布式训练，设置同步梯度
+      model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) #?
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+      logits, loss = model(x, y)  # 前向传播
+    loss = loss / grad_accum_steps
+    loss_accum += loss.detach()
+    loss.backward()
+  if ddp:  # 如果是分布式训练，汇总梯度
+    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    
+  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  #? 梯度裁剪
+  lr = get_lr(step)  # 获取当前学习率
+  ## 更新优化器的学习率 怎么tm在手动做啊
+  for param_group in optimizer.param_groups:
+    param_group['lr'] = lr
+  optimizer.step()  #@ 优化器更新
+  if device_type == "cuda":  # 确保同步
+    torch.cuda.synchronize()
+    
+  t1 = time.time()
+  dt = t1 - t0
+  tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size # 总token数
+  tokens_per_sec = tokens_processed / dt  # 每秒处理的tokens数
+  #@ 日志
+  if master_process:
+    print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f}" + \
+      f" | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    with open(log_file, "a") as f:
+      f.write(f"{step} train {loss_accum.item():.6f}\n")
+      
+# 结束分布式训练时销毁进程组
+if ddp:
+  destroy_process_group()
+  
+  
+      
+      
+      
+
+    
+    
+
+      
+      
+      
+           
+      
 
 
 
