@@ -1,5 +1,6 @@
 # 美化错误输出 ---------------------------------------------------------------------------------------
 import inspect
+from librosa import example
 from rich.traceback import install
 install()
 #---------------------------------------------------------------------------------------------------
@@ -27,6 +28,8 @@ from torch.nn import functional as F
 import torch
 import math
 import os
+import time
+from hellaswag import render_example, iterate_examples # HellaSwag
 
 # 配置文件
 @dataclass
@@ -375,6 +378,50 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
                             split="val")
 
 torch.set_float32_matmul_precision('high')  #? 干嘛？
+
+# 创建模型
+model = GPT(GPTConfig(vocab_size=50304)) 
+# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+model.to(device)
+use_compile = False # torch.compile #?
+if use_compile:
+  model = torch.compile(model)
+if ddp:
+  model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model  #? always contains the "raw" unwrapped model?
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
+max_steps = 19073 # 在10Btoken+batchsize=0.5M的情况下，19073step大约是1epoch #？
+
+def get_lr(it):
+  """学习率调整"""
+  # 1. 如果当前的训练步数（it）小于预热步数（warmup_steps），则进行线性预热
+  if it < warmup_steps:
+    return max_lr + (it + 1) / warmup_steps
+  # 2. 如果当前训练步数大于最大步数（max_steps），则直接返回最小学习率（min_lr）
+  if it > max_steps:
+    return min_lr
+  # 3. 如果当前训练步数处于预热和最大步数之间，则使用余弦衰减的方式计算学习率
+  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+  assert 0 <= decay_ratio <= 1
+  # 该系数会随着训练的进展从1逐渐衰减到0
+  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+  # 系数从1衰减到0，因此最终学习率将从最大值衰减到最小值
+  return min_lr + coeff * (max_lr - min_lr)
+
+# 设置优化器
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, 
+                                           device_type=device_type)
+
+# logdir, 用于存储日志和模型
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:  # 只是为了清空文件
+  pass
+
 
 
 
