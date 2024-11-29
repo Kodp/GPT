@@ -313,9 +313,70 @@ def get_most_likely_row(tokens:torch.Tensor, mask:torch.Tensor, logits:torch.Ten
   
   return pred_norm
 
-  
 
-master_process = None
+# -------------------------------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+#@ 分布式训练设置
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+
+ddp = int(os.environ.get('RANK', -1)) != -1  # ddp 有没有在跑
+if ddp:
+  assert torch.cuda.is_available(), "for now i thnk we need CUDA for DDP"
+  init_process_group(backend='nccl')
+  ddp_rank = int(os.environ['RANK'])
+  ddp_local_rank = int(os.environ['LOCAL_RANK'])
+  ddp_world_size = int(os.environ['WORLD_SIZE'])
+  device = f'cuda:{ddp_local_rank}'
+  torch.cuda.set_device(device)
+  master_process = ddp_rank == 0 # 主进程负责logging，checkpointing，etc.
+else:
+  # 单卡训练
+  ddp_rank = 0
+  ddp_local_rank = 0
+  ddp_world_size = 1
+  master_process = True
+  device = "cpu"
+  if torch.cuda.is_available():
+    device = "cuda"
+  elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"  # Apple
+  print(f"using device: {device}")
+
+# 视频之后添加，pytorch里严格区分device和device_type
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding("gpt2")
+total_batch_size = 524288  # 2**19, ~0.5M，是token的数量
+B = 64   # micro batch size
+T = 1024 # context length 上下文长度
+assert total_batch_size % (B * T * ddp_world_size) == 0, \
+  "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+  print(f"total desired batch size: {total_batch_size}")
+  print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
+                              split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
+                            split="val")
+
+torch.set_float32_matmul_precision('high')  #? 干嘛？
+
+
 
 num_return_sequences = 5
 max_length = 30
