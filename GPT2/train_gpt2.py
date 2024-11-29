@@ -1,8 +1,6 @@
 # 美化错误输出 ---------------------------------------------------------------------------------------
 import inspect
-from platform import node
 from rich.traceback import install
-from zmq import device
 install()
 #---------------------------------------------------------------------------------------------------
 
@@ -280,8 +278,41 @@ class DataLoaderLite:
       self.current_position = B * T * self.process_rank          #? 重置进程位置
     return x, y
     
-      
-    
+# --------------------------------------------------------------------------------------------------
+# 
+def get_most_likely_row(tokens:torch.Tensor, mask:torch.Tensor, logits:torch.Tensor):
+  """辅助 HellaSwag 数据集评估函数。
+  计算并返回最可能的补全对应的行索引。
+  首先计算每个位置的损失，然后在补全区域（mask == 1）内求平均损失，最后返回具有最低损失的行索引作为最可能的补全结果。
+  """
+  #@ B: Batch size, T: sequence length/ Time-step, C: vocab_size
+  #? 一次计算4个选项，但是长度怎么对齐的？合理吗，直接用目标答案的token来计算损失？万一模型前几个词汇预测没有生成答案呢
+  # 去掉最后一个token的logits 
+  shift_logits = (logits[..., :-1, :]).contiguous() # (B,T-1,C)
+  # 去掉第一个token
+  shift_tokens = (tokens[..., 1:]).contiguous()    #  (B,T-1)
+  # 展平，方便计算交叉熵
+  flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1)) #  (B*(T-1),C) 预测的logits
+  flat_shift_tokens = shift_tokens.view(-1)  #  (B*(T-1),) 实际的token
+  # 计算每个位置的交叉熵损失；reduction='none'表示返回每个位置的损失值，而非平均或求和。
+  shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+  
+  shift_losses = shift_losses.view(tokens.size(0), -1)
+  shift_mask = (mask[..., 1:]).contiguous()
+  
+  # 将损失和掩码相乘，掩码为1的地方保留损失，掩码为0的地方将损失设为0。
+  masked_shift_losses = shift_losses * shift_mask
+  # 对于每一行，计算所有非零掩码的损失和，并除以掩码中1的数量，得到平均损失。
+  sum_loss = masked_shift_losses.sum(dim=1) 
+  avg_loss = sum_loss / shift_mask.sum(dim=1)
+  
+  # now we have a loss for each of the 4 completions
+  # the one with the lowest loss should be the most likely
+  # 挑出最小损失的索引，argmin()返回最小值的索引，item()将其转为一个标量值。
+  pred_norm = avg_loss.argmin().item() 
+  
+  return pred_norm
+
   
 
 master_process = None
