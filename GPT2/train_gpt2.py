@@ -28,6 +28,7 @@ from torch import logit, nn
 from torch.nn import functional as F
 import torch
 import math
+import os
 
 # 配置文件
 @dataclass
@@ -229,7 +230,59 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
 import tiktoken
 import numpy as np
 
+def load_tokens(filename) -> torch.Tensor:
+  npt = np.load(filename)
+  npt = npt.astype(np.int32)  # 视频之后添加
+  ptt = torch.tensor(npt, dtype=torch.long)
+  return ptt
 
+class DataLoaderLite:
+  """
+  数据加载器类，用于按分片加载训练或验证数据。支持多进程并行加载，返回指定批次大小和时间步长的数据。
+  每次加载一个批次，自动切换到下一个数据分片以避免超出范围。
+  """
+  def __init__(self, B, T, process_rank, num_processes, split):
+    #
+    # 初始化
+    self.B = B # 批次大小
+    self.T = T # 时间步长
+    self.process_rank = process_rank    # 当前进程的编号
+    self.num_processes = num_processes  # 总进程数
+    assert split in {'train', 'val'} 
+    # 获取数据分片文件名
+    data_root = "edu_fineweb10B"
+    shards = os.listdir(data_root)
+    shards = [s for s in shards if split in s]
+    shards = sorted(shards)
+    shards = [os.path.join(data_root, s) for s in shards]
+    self.shards = shards
+    assert len(shards) > 0, f"no shards found for split {split}"
+    if master_process:
+      print(f"found {len(shards)} shards for split {split}")
+    self.reset()
+    
+  def reset(self):
+    self.current_shard = 0  # 当前分片的索引
+    self.tokens = load_tokens(self.shards[self.current_shard])  #@ 加载当前分片的数据
+    self.current_position = self.B * self.T * self.process_rank # 当前进程在数据中的起始位置
+  
+  def next_batch(self):
+    B, T = self.B, self.T
+    buf = self.tokens[self.current_position : self.current_position+B*T+1]
+    x = (buf[:-1]).view(B, T)  # inputs
+    y = (buf[1:]).view(B, T)   # targets
+    # 更新当前进程的位置
+    self.current_position += B * T * self.num_processes
+    # 如果下一批次的末端超过当前分片数据范围，则加载下一个分片 #? 什么意思？
+    if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+      self.current_shard = (self.current_shard + 1) % len(self.shards)
+      self.tokens = load_tokens(self.shards[self.current_shard]) # 加载新分片数据
+      self.current_position = B * T * self.process_rank          #? 重置进程位置
+    return x, y
+    
+      
+    
+  
 
 master_process = None
 
