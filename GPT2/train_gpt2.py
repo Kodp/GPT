@@ -1,5 +1,8 @@
 # 美化错误输出 ---------------------------------------------------------------------------------------
+import inspect
+from platform import node
 from rich.traceback import install
+from zmq import device
 install()
 #---------------------------------------------------------------------------------------------------
 
@@ -186,9 +189,50 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
         with torch.no_grad():
           sd[k].copy_(sd_hf[k])
     return model
-  
-  
+
+  def configure_optimizers(self, weight_decay, learning_rate, device_type):
+    """配置优化器。
+    根据参数维度将参数分为两组，分别应用不同的weight decay。控制台输出需要优化的参数大小。
+    创建并返回AdamW优化器，若设备为CUDA且支持，使用fused版本的AdamW。
+    """
+    # 获取所有需要梯度更新的参数
+    param_dict = {pn: p for pn, p in self.named_parameters()}  # .named_parameters() 返回参数名+参数本身
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # 挑选需要梯度的
+    # 创建需要decay的参数组：所有>=2维的张量的list；低于2维则nodecay
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    ## 设置字典
+    optim_groups = [
+      {'params':decay_params, 'weight_decay':weight_decay},
+      {'params':nodecay_params, 'weight_decay': 0.0},
+    ]
+    # 计算两组需要优化的参数量
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    # 主进程打印参数量
+    if master_process:   #! 下面ddp里的
+      # {int:,} `,`表示千分位格式化。"1000000" -> "1,000,000"
+      print(f"num decayed parameter tensors: {len(decay_params)}, \
+            with {num_decay_params:,} parameters")
+      print(f"num non-decayed parameter tensors: {len(nodecay_params)}, \
+            with {num_nodecay_params:,} parameters")
+    # 检查能否使用fused版本的AdamW优化器并尝试使用
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device_type == "cuda"
+    if master_process:
+      print(f"using fused AdamW: {use_fused}")
+    optimizer = torch.optim.AdamW(
+      optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    return optimizer
+    
 # --------------------------------------------------------------------------------------------------
+import tiktoken
+import numpy as np
+
+
+
+master_process = None
+
 num_return_sequences = 5
 max_length = 30
 
@@ -223,5 +267,4 @@ for i in range(num_return_sequences):
   tokens = x[i, :max_length].tolist()
   decoded = enc.decode(tokens)
   print(">", decoded)
-    
     
