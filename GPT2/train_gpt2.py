@@ -49,6 +49,7 @@ class CausalSelfAttention(nn.Module):
     assert config.n_embd % config.n_head == 0  
     self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)  #(C,3C) W_q, W_k, W_v, 水平拼接
     self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+    self.c_proj.NANOGPT_SCALE_INIT = 1
     self.n_head = config.n_head
     self.n_embd = config.n_embd
 
@@ -90,7 +91,8 @@ class MLP(nn.Module):
     self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
     self.gelu = nn.GELU(approximate='tanh')
     self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-  
+    self.c_proj.NANOGPT_SCALE_INIT = 1
+    
   def forward(self, x):
     x = self.c_fc(x)
     x = self.gelu(x)
@@ -126,14 +128,24 @@ class GPT(nn.Module): # 继承基类，可以自动反向传播
     # 语言模型的最后一层通常是一个线性层加上 softmax，用于预测下一个单词的概率分布。
     # 去掉偏置项可以简化模型，减少参数量，而且对性能影响不大。
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-  
+    
     # weight sharing scheme 共享softmax之前的线性层和embedding层权重
     self.transformer.wte.weight = self.lm_head.weight  # 原来的wte.weight会变成孤立状态，从而被回收
     
-    # self.apply(self._init_weights)
-  
+    self.apply(self._init_weights)
     
-  
+  # 对照gpt2原始tensorflow代码的初始化
+  def _init_weights(self, module):
+    if isinstance(module, nn.Linear):
+      std = 0.02
+      if hasattr(module, 'NANOGPT_SCALE_INIT'):  
+        std *= (2 * self.config.n_layer) ** -0.5 # 2 来自两次残差连接
+      torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+      if module.bias is not None:
+        torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
   def forward(self, idx: torch.Tensor):
     """idx.shape=(B,T)"""
     B, T = idx.size()
@@ -273,6 +285,7 @@ class DataLoaderLite:
     self.current_shard = 0  # 当前分片的索引
     self.tokens = load_tokens(self.shards[self.current_shard])  #@ 加载当前分片的数据
     self.current_position = self.B * self.T * self.process_rank # 当前进程在数据中的起始位置
+    # 记录取下一个batch的起始位置
   
   def next_batch(self):
     B, T = self.B, self.T
