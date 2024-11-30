@@ -258,11 +258,32 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
 model.to(device)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+  """学习率调整"""
+  # 1. 如果当前的训练步数（it）小于预热步数（warmup_steps），则进行线性预热
+  if it < warmup_steps:
+    return max_lr * (it + 1) / warmup_steps  # +1 是防止第一步学习率为0
+  # 2. 如果当前训练步数大于最大步数（max_steps），则直接返回最小学习率（min_lr）
+  if it > max_steps:
+    return min_lr
+  # 3. 如果当前训练步数处于预热和最大步数之间，则使用余弦衰减的方式计算学习率，该系数会随着训练的进展从1逐渐衰减到0
+  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+  
+  assert 0 <= decay_ratio <= 1
+  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+  # 系数从1衰减到0，因此最终学习率将从最大值衰减到最小值
+  return min_lr + coeff * (max_lr - min_lr)
+  
+
 model.compile()
 # optimize! 按照gpt3论文参数（gpt2论文没给参数，gpt2模型架构和gpt3类似）
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 t_st = time.time()
-for i in range(50):
+for step in range(max_steps):
   t0 = time.time()
   x, y = train_loader.next_batch()
   x, y = x.to(device), y.to(device)
@@ -273,12 +294,16 @@ for i in range(50):
   loss.backward()
   # 控制全梯度L2范数不超过1.0；返回原始全梯度的L2范数
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  
+  lr = get_lr(step)  # 获取学习率
+  for param_group in optimizer.param_groups:  # 需手动更新每一个参数组的学习率
+    param_group['lr'] = lr 
   optimizer.step()
   torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   t1 = time.time()
   dt = (t1 - t0) * 1000  # ms
   tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-  print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+  print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
+        f" dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
   
 t_ed = time.time()
 print(f"total time: {t_ed - t_st:.2f}s")
@@ -318,7 +343,7 @@ while x.size(1) < max_length:
     x = torch.cat((x, xcol), dim=1)
 
 # print the generated text
-for i in range(num_return_sequences):
-  tokens = x[i, :max_length].tolist()
+for step in range(num_return_sequences):
+  tokens = x[step, :max_length].tolist()
   decoded = enc.decode(tokens)
   print(">", decoded)
