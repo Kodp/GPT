@@ -255,6 +255,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig())
 model.to(device)
 
+model.compile()
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 t_st = time.time()
