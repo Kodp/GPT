@@ -255,12 +255,12 @@ train_loader = DataLoaderLite(B=2, T=1024)
 
 torch.set_float32_matmul_precision('high')
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
 model.to(device)
 
 model.compile()
-# optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# optimize! 按照gpt3论文参数（gpt2论文没给参数，gpt2模型架构和gpt3类似）
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 t_st = time.time()
 for i in range(50):
   t0 = time.time()
@@ -271,12 +271,15 @@ for i in range(50):
     logits, loss = model(x, y)
     # import code; code.interact(local=locals())
   loss.backward()
+  # 控制全梯度L2范数不超过1.0；返回原始全梯度的L2范数
+  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  
   optimizer.step()
   torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   t1 = time.time()
   dt = (t1 - t0) * 1000  # ms
   tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-  print(f"step {i:4d}, loss: {loss.item():.6f}, dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+  print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+  
 t_ed = time.time()
 print(f"total time: {t_ed - t_st:.2f}s")
 print(f"tok/sec: {50*train_loader.B*train_loader.T / (t_ed - t_st):.2f}")
