@@ -263,8 +263,9 @@ for i in range(50):
   x, y = train_loader.next_batch()
   x, y = x.to(device), y.to(device)
   optimizer.zero_grad()
-  logits, loss = model(x, y)
-  # import code; code.interact(local=locals())
+  with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    logits, loss = model(x, y)
+    # import code; code.interact(local=locals())
   loss.backward()
   optimizer.step()
   torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
