@@ -1,10 +1,10 @@
-# 美化错误输出 ---------------------------------------------------------------------------------------
+# 美化错误输出 --------------------------------------------------------------------------------------
 import inspect
 from rich.traceback import install
 install()
-#---------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
-# timer 装饰器 --------------------------------------------------------------------------------------
+# timer 装饰器 -------------------------------------------------------------------------------------
 def timing_decorator(func):
   import time
   from functools import wraps  # 导入 wraps 装饰器
@@ -19,7 +19,7 @@ def timing_decorator(func):
     print(f"{lightred}{BOLD}[INFO] {func.__name__} executed in {execution_time:.4f}s{RESET} ")
     return result
   return wrapper
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
 from dataclasses import dataclass
 from torch import logit, nn
@@ -28,7 +28,7 @@ import torch
 import math
 import os
 import time
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
 
@@ -48,23 +48,24 @@ class CausalSelfAttention(nn.Module):
                    .view(1, 1, config.block_size, config.block_size))
 
   def forward(self, x):
+    """
+    计算一个batch的多头QKV, 头维度移动到batch维度
+    nh="number of heads", hs="head size", and C (number of channels) = nh * hs
+    例如GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+    """
     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-    # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-    # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-    # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
     qkv = self.c_attn(x)
     q, k, v = qkv.split(self.n_embd, dim=2)
     k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     
-    # attention (materializes the large (T,T) matrix for all the queries and keys)
+    ## attention (materializes the large (T,T) matrix for all the queries and keys)
     # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
     # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
     # att = F.softmax(att, dim=-1)
     # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
     y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  #$ Flash Attention, 未采用dropout
-    
     y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     # output projection
     y = self.c_proj(y)
@@ -102,7 +103,8 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
   block_size: int = 1024 # max sequence length
-  vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+  # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+  vocab_size: int = 50257 
   n_layer: int = 12 # number of layers
   n_head: int = 12 # number of heads
   n_embd: int = 768 # embedding dimension
@@ -139,20 +141,23 @@ class GPT(nn.Module):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
   def forward(self, idx, targets=None):
-    # idx is of shape (B, T)
-    B, T = idx.size()
-    assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-    # forward the token and posisition embeddings
-    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-    pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
-    tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-    x = tok_emb + pos_emb
-    # forward the blocks of the transformer
+    """计算前向传播；如果targets给定，则额外计算损失
+    idx shape (B, T), targets shape (B, T)
+    """
+    B, T = idx.size() 
+    assert T <= self.config.block_size, \
+      f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+    #@ 取token嵌入和位置嵌入，相加
+    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # (T,)
+    pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+    tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+    x = tok_emb + pos_emb  # (B, T, n_embd)
+    #@ 前向传播所有transformer块
     for block in self.transformer.h:
       x = block(x)
-    # forward the final layernorm and the classifier
+    #@ 前向传播最后一层layernorm和分类层
     x = self.transformer.ln_f(x)
-    logits = self.lm_head(x) # (B, T, vocab_size)
+    logits = self.lm_head(x) #@ (B, T, vocab_size)
     loss = None
     if targets is not None:
       loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) 
@@ -165,52 +170,51 @@ class GPT(nn.Module):
     from transformers import GPT2LMHeadModel
     print("loading weights from pretrained gpt: %s" % model_type)
 
-    # n_layer, n_head and n_embd are determined from model_type
+    # 模型类型决定 n_layer, n_head, n_embd
     config_args = {
       'gpt2':     dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
       'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
       'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
       'gpt2-xl':    dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
     }[model_type]
-    config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-    config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-    # create a from-scratch initialized minGPT model
+    config_args['vocab_size'] = 50257 # 对于gpt checkpoints 都是50257
+    config_args['block_size'] = 1024  # 对于gpt checkpoints 都是1024
+    # 从头开始初始化 miniGPT 模型
     config = GPTConfig(**config_args)
     model = GPT(config)
     sd = model.state_dict()
     sd_keys = sd.keys()
-    sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+    sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # 去掉这种mask/buffer, 因为没有参数
 
-    # init a huggingface/transformers model
+    #@ 加载HF/transfomers的GPT2模型, 并把参数拷贝到我们的模型
     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
     sd_hf = model_hf.state_dict()
-
-    # copy while ensuring all of the parameters are aligned and match in names and shapes
-    sd_keys_hf = sd_hf.keys()
-    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-    # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-    # this means that we have to transpose these weights when we import them
+    ## 确保所有参数对齐且名称和形状匹配的情况下进行复制
+    sd_keys_hf = sd_hf.keys()   # key
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # 忽略buffer
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # 忽略mask（buffer）
+    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 
+                  'mlp.c_proj.weight']  # 需要转置的层
+    ## openai的checkpoint用的是Conv1D层，当前用的是Linear层，所以需要转置
     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-    for k in sd_keys_hf:
-      if any(k.endswith(w) for w in transposed):
-        # special treatment for the Conv1D weights we need to transpose
-        assert sd_hf[k].shape[::-1] == sd[k].shape
-        with torch.no_grad():
-          sd[k].copy_(sd_hf[k].t())
+    for k in sd_keys_hf:  # 遍历从HF加载的模型参数名称
+      if any(k.endswith(w) for w in transposed):  # 如果k以transposed中的任何一个结尾则转置
+        assert sd_hf[k].shape[::-1] == sd[k].shape # 访问sd[k],如果k不在我们的模型中会报错 
+        with torch.no_grad():  # 防止跟踪梯度
+          sd[k].copy_(sd_hf[k].t())  # 修改sd[k]为sd_hf[k]的转置，原地修改_
       else:
-        # vanilla copy over the other parameters
         assert sd_hf[k].shape == sd[k].shape
         with torch.no_grad():
           sd[k].copy_(sd_hf[k])
-
     return model
+
   
   def configure_optimizers(self, weight_decay, learning_rate, device_type):
     """配置优化器。
     根据参数维度将参数分为两组，分别应用不同的weight decay（L2正则化）。控制台输出需要优化的参数大小。
     创建并返回AdamW优化器，若设备为CUDA且支持，使用fused版本的AdamW。
+    
+    注意：参数设置参考gpt3论文（gpt2论文没给参数，gpt2模型架构和gpt3类似）。
     """
     # 获取所有需要梯度更新的参数
     param_dict = {pn: p for pn, p in self.named_parameters()}  # .named_parameters() 返回参数名+参数本身
@@ -239,7 +243,7 @@ class GPT(nn.Module):
       optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
 
-#% -------------------------------------------------------------------------------------------------
+#% ------------------------------------------------------------------------------------------------
 import tiktoken
 
 class DataLoaderLite:
@@ -247,7 +251,7 @@ class DataLoaderLite:
     self.B = B
     self.T = T
 
-    # at init load tokens from disk and store them in memory
+    # 加载数据到内存（之后要改数据）
     with open('input.txt', 'r') as f:
       text = f.read()
     enc = tiktoken.get_encoding('gpt2')
@@ -261,17 +265,16 @@ class DataLoaderLite:
   def next_batch(self):
     B, T = self.B, self.T
     buf = self.tokens[self.current_position : self.current_position+B*T+1]
-    x = (buf[:-1]).view(B, T) # inputs
-    y = (buf[1:]).view(B, T) # targets
-    # advance the position in the tensor
-    self.current_position += B * T
-    # if loading the next batch would be out of bounds, reset
+    x = (buf[:-1]).view(B, T) #@ inputs（idx）
+    y = (buf[1:]).view(B, T) #@ targets
+    self.current_position += B * T # 前进一个Batch步长
+    # 如果下一个位置超过末端，就直接归0。BUG 存在最后一部分数据永远无法访问到的情况。
     if self.current_position + (B * T + 1) > len(self.tokens):
       self.current_position = 0
     return x, y
 
-# -----------------------------------------------------------------------------
-# attempt to autodetect the device
+#% ------------------------------------------------------------------------------------------------
+#@ 自动检测设备
 device = "cpu"
 device_type = "cpu"
 if torch.cuda.is_available():
@@ -281,12 +284,14 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
   device = "mps"
 print(f"using device: {device}")
 
+#@ 设置种子
 torch.manual_seed(1337)
 if torch.cuda.is_available():
   torch.cuda.manual_seed(1337)
 
+#@ 设置批量大小
 total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
-B = 2 # mirco batch size， 多个micro batch组成一个batch，因为要累积梯度 (作者的B用的是16)
+B = 4 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
 T = 1024
 assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
 grad_accum_steps = total_batch_size // (B * T)
@@ -294,11 +299,11 @@ print(f"total desired batch size: {total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-
 train_loader = DataLoaderLite(B=B, T=T, grad_accum_steps=grad_accum_steps)
 
-torch.set_float32_matmul_precision('high')
-# get logits
+torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
+
+#@ 创建模型
 model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
 model.to(device)
 
@@ -323,10 +328,13 @@ def get_lr(it):
   return min_lr + coeff * (max_lr - min_lr)
   
 
-model.compile()
-# optimize! 按照gpt3论文参数（gpt2论文没给参数，gpt2模型架构和gpt3类似）
+model.compile()  #@ 编译模型
+
+#@ 创建优化器
 # optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+#@ 训练
 t_st = time.time()
 for step in range(max_steps):
   t0 = time.time()
@@ -362,10 +370,15 @@ print(f"total training time: {t_ed - t_st:.2f}s")
 print(f"tok/sec: {50*train_loader.B*train_loader.T / (t_ed - t_st):.2f}")
 import sys; sys.exit(0)
 
+#$ ------------------------------------------------------------------------------------------------
 # prefix tokens
+model = GPT.from_pretrained('gpt2')
+model.to(device)  # 不需要model=model.to(device)
 model.eval()
 num_return_sequences = 5
 max_length = 30
+
+enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
@@ -378,7 +391,8 @@ torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
   # forward the model to get the logits
   with torch.no_grad():
-    logits = model(x) # (B, T, vocab_size)
+    output = model(x) # (B, T, vocab_size)
+    logits = output[0] if isinstance(output, tuple) else output  # 一个或两个返回值
     # take the logits at the last position
     logits = logits[:, -1, :] # (B, vocab_size)
     # get the probabilities
