@@ -1,4 +1,5 @@
 # 美化错误输出 ---------------------------------------------------------------------------------------
+import inspect
 from rich.traceback import install
 install()
 #---------------------------------------------------------------------------------------------------
@@ -205,6 +206,38 @@ class GPT(nn.Module):
           sd[k].copy_(sd_hf[k])
 
     return model
+  
+  def configure_optimizers(self, weight_decay, learning_rate, device_type):
+    """配置优化器。
+    根据参数维度将参数分为两组，分别应用不同的weight decay（L2正则化）。控制台输出需要优化的参数大小。
+    创建并返回AdamW优化器，若设备为CUDA且支持，使用fused版本的AdamW。
+    """
+    # 获取所有需要梯度更新的参数
+    param_dict = {pn: p for pn, p in self.named_parameters()}  # .named_parameters() 返回参数名+参数本身
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # 挑选需要梯度的
+    # 创建需要decay的参数组：所有>=2维的张量（例如权重，embedding）；低于2维则nodecay（例如biases，LayerNorm）
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    # 设置参数组字典，之后传给AdamW
+    optim_groups = [
+      {'params':decay_params, 'weight_decay':weight_decay},
+      {'params':nodecay_params, 'weight_decay': 0.0},
+    ]
+    # 计算两组需要优化的参数量
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(f"num decayed parameter tensors: {len(decay_params)}", \
+            f"with {num_decay_params:,} parameters")
+    print(f"num non-decayed parameter tensors: {len(nodecay_params)}", \
+            f"with {num_nodecay_params:,} parameters")
+    # 检查能否使用fused版本的AdamW优化器并尝试使用 （fused指的是kernel融合，提高计算性能）
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device_type == "cuda" # fused只支持cuda
+    use_fused=False
+    print(f"using fused AdamW: {use_fused}")
+    optimizer = torch.optim.AdamW(
+      optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    return optimizer
 
 # -----------------------------------------------------------------------------
 import tiktoken
@@ -241,8 +274,10 @@ class DataLoaderLite:
 # -----------------------------------------------------------------------------
 # attempt to autodetect the device
 device = "cpu"
+device_type = "cpu"
 if torch.cuda.is_available():
   device = "cuda"
+  device_type = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
   device = "mps"
 print(f"using device: {device}")
@@ -281,7 +316,8 @@ def get_lr(it):
 
 model.compile()
 # optimize! 按照gpt3论文参数（gpt2论文没给参数，gpt2模型架构和gpt3类似）
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 t_st = time.time()
 for step in range(max_steps):
   t0 = time.time()
@@ -303,10 +339,10 @@ for step in range(max_steps):
   dt = (t1 - t0) * 1000  # ms
   tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
   print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
-        f" dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+        f"dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
   
 t_ed = time.time()
-print(f"total time: {t_ed - t_st:.2f}s")
+print(f"total training time: {t_ed - t_st:.2f}s")
 print(f"tok/sec: {50*train_loader.B*train_loader.T / (t_ed - t_st):.2f}")
 import sys; sys.exit(0)
 
