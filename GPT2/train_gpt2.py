@@ -28,7 +28,7 @@ import torch
 import math
 import os
 import time
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
 
@@ -155,7 +155,7 @@ class GPT(nn.Module):
     logits = self.lm_head(x) # (B, T, vocab_size)
     loss = None
     if targets is not None:
-      loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+      loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) 
     return logits, loss
 
   @classmethod
@@ -239,11 +239,11 @@ class GPT(nn.Module):
       optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
 
-# -----------------------------------------------------------------------------
+#% -------------------------------------------------------------------------------------------------
 import tiktoken
 
 class DataLoaderLite:
-  def __init__(self, B, T):
+  def __init__(self, B, T, grad_accum_steps=1):
     self.B = B
     self.T = T
 
@@ -254,10 +254,9 @@ class DataLoaderLite:
     tokens = enc.encode(text)
     self.tokens = torch.tensor(tokens)
     print(f"loaded {len(self.tokens)} tokens")
-    print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
-    # state
-    self.current_position = 0
+    print(f"with grad accum 1 epoch = {len(self.tokens) // (B * T * grad_accum_steps)} batches")
+    # 整个 tinyShakespeare 一共 338025 个token。 524288>338025
+    self.current_position = 0 # state
 
   def next_batch(self):
     B, T = self.B, self.T
@@ -286,7 +285,17 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
   torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=2, T=1024)
+total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
+B = 2 # mirco batch size， 多个micro batch组成一个batch，因为要累积梯度 (作者的B用的是16)
+T = 1024
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+
+
+train_loader = DataLoaderLite(B=B, T=T, grad_accum_steps=grad_accum_steps)
 
 torch.set_float32_matmul_precision('high')
 # get logits
@@ -321,13 +330,19 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 t_st = time.time()
 for step in range(max_steps):
   t0 = time.time()
-  x, y = train_loader.next_batch()
-  x, y = x.to(device), y.to(device)
   optimizer.zero_grad()
-  with torch.autocast(device_type=device, dtype=torch.bfloat16):
-    logits, loss = model(x, y)
+  loss_accum = 0.0
+  for micro_step in range(grad_accum_steps):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+      logits, loss = model(x, y)
+    # cross_entropy 默认reduction=mean，损失计算公式为L/B。
+    # 梯度累积的情况下使用小批量B/gas，也就是L*gas/B，还需要除以一个gas。
+    loss /= grad_accum_steps
+    loss_accum += loss.detach()
+    loss.backward()
     # import code; code.interact(local=locals())
-  loss.backward()
   # 控制全梯度L2范数不超过1.0；返回原始全梯度的L2范数
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  
   lr = get_lr(step)  # 获取学习率
@@ -336,10 +351,11 @@ for step in range(max_steps):
   optimizer.step()
   torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   t1 = time.time()
-  dt = (t1 - t0) * 1000  # ms
-  tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-  print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
-        f"dt: {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+  dt = t1 - t0
+  tokens_processed = train_loader.B * train_loader.T * grad_accum_steps  # 524288
+  tokens_per_sec = tokens_processed / dt
+  print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
+        f"dt: {dt*1000:.2f}ms | tok/sec {tokens_per_sec:.2f}")
   
 t_ed = time.time()
 print(f"total training time: {t_ed - t_st:.2f}s")
