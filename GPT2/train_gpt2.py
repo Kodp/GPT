@@ -1,3 +1,13 @@
+import os
+import math
+import time
+import inspect
+from dataclasses import dataclass
+from turtle import back
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
 # 美化错误输出 --------------------------------------------------------------------------------------
 import inspect
 from rich.traceback import install
@@ -21,14 +31,7 @@ def timing_decorator(func):
   return wrapper
 # -------------------------------------------------------------------------------------------------
 
-from dataclasses import dataclass
-from torch import logit, nn
-from torch.nn import functional as F
-import torch
-import math
-import os
-import time
-# -------------------------------------------------------------------------------------------------
+#%1 -----------------------------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
 
@@ -208,7 +211,6 @@ class GPT(nn.Module):
           sd[k].copy_(sd_hf[k])
     return model
 
-  
   def configure_optimizers(self, weight_decay, learning_rate, device_type):
     """配置优化器。
     根据参数维度将参数分为两组，分别应用不同的weight decay（L2正则化）。控制台输出需要优化的参数大小。
@@ -230,59 +232,98 @@ class GPT(nn.Module):
     # 计算两组需要优化的参数量
     num_decay_params = sum(p.numel() for p in decay_params)
     num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    print(f"num decayed parameter tensors: {len(decay_params)}", \
-            f"with {num_decay_params:,} parameters")
-    print(f"num non-decayed parameter tensors: {len(nodecay_params)}", \
-            f"with {num_nodecay_params:,} parameters")
+    if master_process:
+      print(f"num decayed parameter tensors: {len(decay_params)}", \
+              f"with {num_decay_params:,} parameters")
+      print(f"num non-decayed parameter tensors: {len(nodecay_params)}", \
+              f"with {num_nodecay_params:,} parameters")
     # 检查能否使用fused版本的AdamW优化器并尝试使用 （fused指的是kernel融合，提高计算性能）
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and device_type == "cuda" # fused只支持cuda
     use_fused=False
-    print(f"using fused AdamW: {use_fused}")
+    if master_process:
+      print(f"using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(
       optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
 
-#% ------------------------------------------------------------------------------------------------
+#%2 ------------------------------------------------------------------------------------------------
 import tiktoken
 
 class DataLoaderLite:
-  def __init__(self, B, T, grad_accum_steps=1):
+  def __init__(self, B, T, process_rank, num_processes):
+    """简易数据加载器。
+    B:
+    T:
+    process_rank:
+    num_processes:
+    """
     self.B = B
     self.T = T
-
+    self.process_rank = process_rank
+    self.num_processes = num_processes
     # 加载数据到内存（之后要改数据）
     with open('input.txt', 'r') as f:
       text = f.read()
     enc = tiktoken.get_encoding('gpt2')
     tokens = enc.encode(text)
     self.tokens = torch.tensor(tokens)
-    print(f"loaded {len(self.tokens)} tokens")
-    print(f"with grad accum 1 epoch = {len(self.tokens) // (B * T * grad_accum_steps)} batches")
-    # 整个 tinyShakespeare 一共 338025 个token。 524288>338025
-    self.current_position = 0 # state
+    if master_process:  # fix 下面的全局变量
+      print(f"loaded {len(self.tokens)} tokens")
+    
+    self.data_chunk_size = B * T * self.num_processes   # 全部设备（进程）的访问数据块大小
+    self.current_position = self.B * self.T * self.process_rank  # 当前设备（进程）的访问数据的起始位置
+    
 
   def next_batch(self):
     B, T = self.B, self.T
     buf = self.tokens[self.current_position : self.current_position+B*T+1]
     x = (buf[:-1]).view(B, T) #@ inputs（idx）
-    y = (buf[1:]).view(B, T) #@ targets
-    self.current_position += B * T # 前进一个Batch步长
-    # 如果下一个位置超过末端，就直接归0。BUG 存在最后一部分数据永远无法访问到的情况。
-    if self.current_position + (B * T + 1) > len(self.tokens):
-      self.current_position = 0
+    y = (buf[1:]).view(B, T)  #@ targets
+    # 前进一个「Batch*进程数量」步长。「Batch*进程数量」是全部进程的访问区块，每个进程只访问其中一块，避免重复
+    self.current_position += self.data_chunk_size
+    # 如果下一个位置超过末端，就直接归于初始状态。BUG 存在最后一部分数据永远无法访问到的情况。
+    if self.current_position + (self.data_chunk_size + 1) > len(self.tokens):
+      self.current_position = self.B * self.T * self.process_rank
     return x, y
 
-#% ------------------------------------------------------------------------------------------------
-#@ 自动检测设备
-device = "cpu"
-device_type = "cpu"
-if torch.cuda.is_available():
-  device = "cuda"
+#@3 ------------------------------------------------------------------------------------------------
+# 单卡：$ python train_gpt2.py
+# DataDistributedParallel 数据分布式并行训练，8卡：
+# $ torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+#? 这三个玩意一般怎么用？accelerate封装了他们，怎么替代他们实现？
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+#@ 设置ddp，设备
+# torchrun命令会设置环境变量 RANK, LOCAL_RANK, WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1  # 查看ddp有没有运行, #FIX 不太好的方式
+if ddp:
+  assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+  init_process_group(backend='nccl')
+  ddp_rank = int(os.environ['RANK'])  # 显卡编号
+  ddp_local_rank = int(os.environ['LOCAL_RANK'])  # 主机编号，不用
+  ddp_world_size = int(os.environ['WORLD_SIZE'])  # 总卡的数量，一台主机即一台主机上卡的数量
+  device = f'cuda:{ddp_local_rank}'
   device_type = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-  device = "mps"
-print(f"using device: {device}")
+  torch.cuda.set_device(device)
+  master_process = ddp_rank == 0 # 主进程负责日志、保存权重等
+else:
+  # vanilla, non-DDP run
+  ddp_rank = 0
+  ddp_local_rank = 0
+  ddp_world_size = 1
+  master_process = True
+  device = "cpu"
+  device_type = "cpu"
+  if torch.cuda.is_available():
+    device = "cuda"
+    device_type = "cuda"
+  elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+  print(f"using device: {device}")
 
 #@ 设置种子
 torch.manual_seed(1337)
@@ -293,24 +334,36 @@ if torch.cuda.is_available():
 total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
 B = 4 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
 T = 1024
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, \
+  "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)  #! 小心计算
+if master_process:
+  print(f"total desired batch size: {total_batch_size}")
+  print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-train_loader = DataLoaderLite(B=B, T=T, grad_accum_steps=grad_accum_steps)
-
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+# print(f"with grad accum 1 epoch = {len(train_loader.tokens) // (B * T * grad_accum_steps)} batches")
+# 整个 tinyShakespeare 一共 338025 个token。 524288>338025
 torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
 
 #@ 创建模型
 model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
 model.to(device)
+model.compile()  #@ 编译模型
+if ddp:
+  model = DDP(model, device_ids=[ddp_local_rank])  # 模型->DDP模型
+raw_model = model.module if ddp else model  # 需要在模型本体上设置优化器参数
+
+#@ 创建优化器
+# optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715  # gpt3论文，预热375Mtokens，375M/524288=715
+max_steps = 19073   # 总共训练10Btokens，10B/524288=19073
+
 def get_lr(it):
   """学习率调整"""
   # 1. 如果当前的训练步数（it）小于预热步数（warmup_steps），则进行线性预热
@@ -327,13 +380,6 @@ def get_lr(it):
   # 系数从1衰减到0，因此最终学习率将从最大值衰减到最小值
   return min_lr + coeff * (max_lr - min_lr)
   
-
-model.compile()  #@ 编译模型
-
-#@ 创建优化器
-# optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-
 #@ 训练
 t_st = time.time()
 for step in range(max_steps):
@@ -344,15 +390,19 @@ for step in range(max_steps):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-      logits, loss = model(x, y)
-    # cross_entropy 默认reduction=mean，损失计算公式为L/B。
-    # 梯度累积的情况下使用小批量B/gas，也就是L*gas/B，还需要除以一个gas。
+      logits, loss = model(x, y) # 计算出来的是micro_batch的loss
+    # cross_entropy 默认reduction=mean，损失计算公式为sum L_i/B。
+    # 梯度累积的情况下使用小批量B/gas，也就是sum L_per_micro*gas/B，还需要除以一个gas。
     loss /= grad_accum_steps
     loss_accum += loss.detach()
-    loss.backward()
-    # import code; code.interact(local=locals())
+    # 在最后一个micro_step的时候才运行backward计算；减少backward次数。因为backward会卡间通信，很慢；非标准方式
+    if ddp:
+      model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
+    loss.backward()  #？ 梯度计算，会让所有的卡都算，然后共享？
+  if ddp:  # 累加平均每个gpu上的loss
+    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
   # 控制全梯度L2范数不超过1.0；返回原始全梯度的L2范数
-  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  
+  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   lr = get_lr(step)  # 获取学习率
   for param_group in optimizer.param_groups:  # 需手动更新每一个参数组的学习率
     param_group['lr'] = lr 
@@ -360,14 +410,18 @@ for step in range(max_steps):
   torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   t1 = time.time()
   dt = t1 - t0
-  tokens_processed = train_loader.B * train_loader.T * grad_accum_steps  # 524288
+  tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size # 524288
   tokens_per_sec = tokens_processed / dt
-  print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
+  if master_process:
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
         f"dt: {dt*1000:.2f}ms | tok/sec {tokens_per_sec:.2f}")
   
 t_ed = time.time()
 print(f"total training time: {t_ed - t_st:.2f}s")
 print(f"tok/sec: {50*train_loader.B*train_loader.T / (t_ed - t_st):.2f}")
+
+if ddp:
+  destroy_process_group()
 import sys; sys.exit(0)
 
 #$ ------------------------------------------------------------------------------------------------
