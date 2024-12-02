@@ -249,9 +249,18 @@ class GPT(nn.Module):
 
 #%2 ------------------------------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens(filename) -> torch.Tensor:
+  """从磁盘上加载numpy数据(token)，返回torch tensor"""
+  npt = np.load(filename)  # 加载已经预处理好的数据集：gpt2token格式
+  npt = npt.astype(np.int32)  # can't convert np.ndarray of type numpy.uint16.  
+  ptt = torch.tensor(npt, dtype=torch.long)  #TODO long? 似乎可以优化，毕竟只是token。减少显存占用。
+  return ptt
+  
 
 class DataLoaderLite:
-  def __init__(self, B, T, process_rank, num_processes):
+  def __init__(self, B, T, process_rank, num_processes, split):
     """简易数据加载器。
     B:
     T:
@@ -262,28 +271,44 @@ class DataLoaderLite:
     self.T = T
     self.process_rank = process_rank
     self.num_processes = num_processes
+    assert split in {'train', 'val'}  # train or val
+    
     # 加载数据到内存（之后要改数据）
-    with open('input.txt', 'r') as f:
-      text = f.read()
-    enc = tiktoken.get_encoding('gpt2')
-    tokens = enc.encode(text)
-    self.tokens = torch.tensor(tokens)
-    if master_process:  # fix 下面的全局变量
-      print(f"loaded {len(self.tokens)} tokens")
+    # with open('input.txt', 'r') as f:
+    #   text = f.read()
+    # enc = tiktoken.get_encoding('gpt2')
+    # tokens = enc.encode(text)
+    # self.tokens = torch.tensor(tokens)
     
-    self.data_chunk_size = B * T * self.num_processes   # 全部设备（进程）的访问数据块大小
-    self.current_position = self.B * self.T * self.process_rank  # 当前设备（进程）的访问数据的起始位置
+    data_root = "edu_fineweb10B"  #fix 硬编码
+    shards = os.listdir(data_root)  # listdir获取路径下所有文件名、文件夹名
+    shards = [s for s in shards if split in s]  # 选择train或val数据的文件名
+    shards = sorted(shards)   # 排序（文件名本身有序）
+    shards = [os.path.join(data_root, s) for s in shards]  # 拼接为完整路径
+    self.shards = shards
+    assert len(shards) > 0, f"no shards found for split {split}"
     
-
+    if master_process:  #fix master_process是下面的全局变量
+      print(f"found {len(shards)} shards for split {split}")
+    
+    self.current_shard = 0
+    self.tokens = load_tokens(shards[self.current_shard])  # tensor token 数据
+    self.current_position = self.B * self.T * self.process_rank  # 当前设备（进程）的访问数据块的起始位置
+    self.data_chunk_size = B * T * self.num_processes   # 全部设备（进程）的访问数据页大小；[块 块]=页
+    
   def next_batch(self):
     B, T = self.B, self.T
     buf = self.tokens[self.current_position : self.current_position+B*T+1]
     x = (buf[:-1]).view(B, T) #@ inputs（idx）
     y = (buf[1:]).view(B, T)  #@ targets
-    # 前进一个「Batch*进程数量」步长。「Batch*进程数量」是全部进程的访问区块，每个进程只访问其中一块，避免重复
-    self.current_position += self.data_chunk_size
-    # 如果下一个位置超过末端，就直接归于初始状态。BUG 存在最后一部分数据永远无法访问到的情况。
+    
+    # 分片0[分页0[[块0]，[块1],...], 分页1[[块0]，[块1],...], ...]
+    # 前进一个「Batch*进程数量」步长。「Batch*进程数量」是全部进程的访问页，每个进程只访问其中一块，避免重复
+    self.current_position += self.data_chunk_size  #* 前进一个分页
+    # 如果下一个位置超过末端，就前进到下一个分片。BUG 存在最后一部分数据永远无法访问到的情况。
     if self.current_position + (self.data_chunk_size + 1) > len(self.tokens):
+      self.current_shard = (self.current_shard + 1) % len(self.shards)  #* 前进一个分片
+      self.tokens = load_tokens(self.shards[self.current_shard])
       self.current_position = self.B * self.T * self.process_rank
     return x, y
 
@@ -342,7 +367,8 @@ if master_process:
   print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(
+  B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 # print(f"with grad accum 1 epoch = {len(train_loader.tokens) // (B * T * grad_accum_steps)} batches")
 # 整个 tinyShakespeare 一共 338025 个token。 524288>338025
 torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
@@ -362,7 +388,9 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715  # gpt3论文，预热375Mtokens，375M/524288=715
-max_steps = 19073   # 总共训练10Btokens，10B/524288=19073
+max_steps = 10**10 // total_batch_size    # 总共训练10Btokens，10B/524288=19073
+if master_process:
+  print(f"max steps: {max_steps}, warmup steps: {warmup_steps}")
 
 def get_lr(it):
   """学习率调整"""
@@ -407,7 +435,10 @@ for step in range(max_steps):
   for param_group in optimizer.param_groups:  # 需手动更新每一个参数组的学习率
     param_group['lr'] = lr 
   optimizer.step()
-  torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
+  if device_type == "cuda":
+    for i in range(torch.cuda.device_count()):
+      torch.cuda.synchronize(i)
+    # torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   t1 = time.time()
   dt = t1 - t0
   tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size # 524288
