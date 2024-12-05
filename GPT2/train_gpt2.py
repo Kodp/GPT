@@ -8,11 +8,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# 美化错误输出 --------------------------------------------------------------------------------------
+# 美化错误输出 ------------------------------------------------------------------------------------
 import inspect
 from rich.traceback import install
+
+from hellaswag import render_example, iterate_examples
 install()
-# -------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------
 
 #%1 -----------------------------------------------------------------------------------------------
 
@@ -230,7 +232,7 @@ class GPT(nn.Module):
       optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
 
-#%2 ------------------------------------------------------------------------------------------------
+#%2 ---------------------------------------------------------------------------------------------
 import tiktoken
 import numpy as np
 
@@ -296,10 +298,52 @@ class DataLoaderLite:
     if self.current_position + (self.data_chunk_size + 1) > len(self.tokens):
       self.current_shard = (self.current_shard + 1) % len(self.shards)  #* 前进一个分片
       self.tokens = load_tokens(self.shards[self.current_shard])
-      self.current_position = self.B * self.T * self.process_rank
+      self.current_position = B * T * self.process_rank
     return x, y
 
-#@3 ------------------------------------------------------------------------------------------------
+#%3 ----------------------------------------------------------------------------------------------
+
+def get_most_likely_row(tokens:torch.Tensor, mask:torch.Tensor, logits:torch.Tensor):
+  """HellSwag 评估的辅助函数
+  计算并返回最可能的补全对应的行索引。
+  计算每个位置的损失，然后在补全区域，亦即需要回答的地方（mask == 1）内求平均损失，
+    最后返回具有最低损失的行索引作为最可能的补全结果。
+  Args:
+    tokens: 输入token，shape (B, T)
+    mask: 二值掩码，shape (B, T)
+    logits: 模型输出的logits，shape (B, T, C)
+  >>> mask
+  ([[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]],)
+    
+    A man is sitting on a roof. he is using wrap to wrap a pair of skis.
+    A man is sitting on a roof. he is ripping level tiles off.!!!!!
+    A man is sitting on a roof. he is holding a rubik's cube.!!!
+    A man is sitting on a roof. he starts pulling up roofing on a roof.!!
+  """
+  shift_logits = (logits[..., :-1, :]).contiguous()  # (B,T-1,C)
+  shift_tokens = (tokens[..., 1:]).contiguous()      # (B,T-1)
+  flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1)) # 展平，方便计算交叉熵
+  flat_shift_tokens = shift_tokens.view(-1)
+  # 计算每个位置的交叉熵损失；reduction='none'表示返回每个位置的损失值，而非平均或求和。
+  shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')  
+  shift_losses = shift_losses.view(tokens.size(0), -1)  
+  # 将损失和掩码相乘，掩码为1的地方保留损失，掩码为0的地方将损失设为0。
+  shift_mask = (mask[..., 1:]).contiguous()
+  masked_shift_losses = shift_losses * shift_mask  #$ 逐元素相乘，只保留了可能答案部分(mask==1)的loss
+  # 对于每一行，计算所有非零掩码的损失和，并除以掩码中1的数量，得到平均损失。
+  sum_loss = masked_shift_losses.sum(dim=1)
+  avg_loss = sum_loss / shift_mask.sum(dim=1)
+  # 现在已经计算出了对于4个选项的loss
+  # 挑出最小损失的索引，argmin()返回最小值的索引，item()将其转为一个标量值。
+  pred_norm = avg_loss.argmin().item()  
+  # import code; code.interact(local=locals()) #debug
+
+  return pred_norm
+
+#%4 ----------------------------------------------------------------------------------------------
 # 单卡：$ python train_gpt2.py
 # DataDistributedParallel 数据分布式并行训练，8卡：
 # $ torchrun --standalone --nproc_per_node=8 train_gpt2.py
@@ -346,7 +390,7 @@ enc = tiktoken.get_encoding('gpt2')
 
 #@ 设置批量大小
 total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
-B = 8 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
+B = 4 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, \
   "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -369,15 +413,12 @@ model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂�
 model.to(device)
 use_compile = False
 if use_compile:
-  model.compile()  #@ 编译模型
+  model = torch.compile(model)  #@ 编译模型
 if ddp:
   model = DDP(model, device_ids=[ddp_local_rank])  # 模型->DDP模型
 raw_model = model.module if ddp else model  # 需要在模型本体上设置优化器参数
 
-#@ 创建优化器
-# optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-
+#@ 学习率
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715  # gpt3论文，预热375Mtokens，375M/524288=715
@@ -401,13 +442,25 @@ def get_lr(it):
   # 系数从1衰减到0，因此最终学习率将从最大值衰减到最小值
   return min_lr + coeff * (max_lr - min_lr)
 
-#@ 训练流程
+#@ 创建优化器
+# optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+#@ log
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: 
+  pass
+
+#@ 主循环
 t_st = time.time()
 for step in range(max_steps):
   t0 = time.time()
+  last_step = (step == max_steps - 1)
   
   #@ 验证
-  if step % 5 == 0:
+  if step % 250 == 0 or last_step:
     model.eval()
     val_loader.reset()
     with torch.no_grad():
@@ -424,9 +477,42 @@ for step in range(max_steps):
       dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
     if master_process:
       print(f"validation loss: {val_loss_accum.item():.4f}")
+      with open(log_file, "a") as f:
+        f.write(f"{step} val {val_loss_accum.item():.4f}\n")
 
-  #@ 生成文本，模型如果compile了那么这里会报错
-  if step > 0 and step % 5 == 0 and not use_compile:
+  #@ HellaSwag
+  if (step % 250 == 0 or last_step) and (not use_compile):
+    num_correct_norm = 0 # 正确的预测数
+    num_total = 0        # 总的预测数
+    for i, example in enumerate(iterate_examples("val")):
+      if i % ddp_world_size != ddp_rank: continue  # 每个进程只处理自己的部分，只取其rank的倍数位置的数据
+      _, tokens, mask, label = render_example(example)
+      tokens = tokens.to(device)
+      mask = mask.to(device)
+      with torch.no_grad():
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+          logits, loss = model(tokens)  # 获取模型输出
+        pred_norm = get_most_likely_row(tokens, mask, logits)
+      num_total += 1
+      num_correct_norm += int(pred_norm == label) # 统计正确的预测
+      ## 如果是分布式训练，汇总所有进程的统计数据
+    if ddp:
+      num_total = torch.tensor(num_total, dtype=torch.long, device=device) # 为了能用dist转为tensor
+      num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+      #* 因为还没做csapp倒数第二个lab，所以不懂并行是怎么弄的 
+      dist.all_reduce(num_total, op=dist.ReduceOp.SUM) 
+      dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+      num_total = num_total.item()     # 再转回数值
+      num_correct_norm = num_correct_norm.item()
+    acc_norm = num_correct_norm / num_total
+    if master_process:
+      print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+      with open(log_file, "a") as f:
+        f.write(f"{step} hella {acc_norm:.4f}\n")
+    
+  #@ 生成文本
+  # 模型如果compile了那么这里会报错，因为compile后模型输入输出被固定，而生成时长度会有变化
+  if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
     model.eval()
     num_return_sequences = 4
     max_length = 32  # 生成token的最大数量
@@ -438,7 +524,8 @@ for step in range(max_steps):
     sample_rng.manual_seed(42 + ddp_rank)
     while xgen.size(1) < max_length:
       with torch.no_grad():
-        logits, loss = model(xgen) # (B, T, vocab_size)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          logits, loss = model(xgen) # (B, T, vocab_size)
         logits = logits[:, -1, :] # (B, vocab_size) # 取最后一个位置的 logits
         probs = F.softmax(logits, dim=-1) # (B, vocab_size) # softmax获取概率
         # 进行 top-k 采样，k=50（Hugging Face pipeline 的默认值）
@@ -451,7 +538,7 @@ for step in range(max_steps):
         # 将其附加到序列中
         xgen = torch.cat((xgen, xcol), dim=1)
     for i in range(num_return_sequences): # 逐行打印
-      tokens = xgen[i, :max_length].tolist()
+      tokens = xgen[i, :max_length].tolist() #? :max_length多此一举？
       decoded = enc.decode(tokens) 
       print(f"rank {ddp_rank} sample {i}: {decoded}")
 
@@ -489,8 +576,10 @@ for step in range(max_steps):
   tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size # 524288
   tokens_per_sec = tokens_processed / dt
   if master_process:
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
-        f"dt: {dt*1000:.2f}ms | tok/sec {tokens_per_sec:.2f}")
+    print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} |", \
+      f"dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    with open(log_file, "a") as f:
+      f.write(f"{step} train {loss_accum.item():.6f}\n")
   
 t_ed = time.time()
 print(f"total training time: {t_ed - t_st:.2f}s")
@@ -498,44 +587,6 @@ print(f"tok/sec: {50*train_loader.B*train_loader.T / (t_ed - t_st):.2f}")
 
 if ddp:
   destroy_process_group()
+  
+
 import sys; sys.exit(0)
-
-#$ ------------------------------------------------------------------------------------------------
-# prefix tokens
-model = GPT.from_pretrained('gpt2')
-model.to(device)  # 不需要model=model.to(device)
-model.eval()
-num_return_sequences = 5
-max_length = 30
-
-
-
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-  # forward the model to get the logits
-  with torch.no_grad():
-    output = model(x) # (B, T, vocab_size)
-    logits = output[0] if isinstance(output, tuple) else output  # 一个或两个返回值
-    # take the logits at the last position
-    logits = logits[:, -1, :] # (B, vocab_size)
-    # get the probabilities
-    probs = F.softmax(logits, dim=-1)
-    # do top-k sampling of 50 (huggingface pipeline default)
-    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-    # select a token from the top-k probabilities
-    # note: multinomial does not demand the input to sum to 1
-    ix = torch.multinomial(topk_probs, 1) # (B, 1)
-    # gather the corresponding indices
-    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-    # append to the sequence
-    x = torch.cat((x, xcol), dim=1)
-
-# print the generated text
-for step in range(num_return_sequences):
-  tokens = x[step, :max_length].tolist()
-  decoded = enc.decode(tokens)
-  print(">", decoded)
