@@ -31,9 +31,9 @@ class CausalSelfAttention(nn.Module):
     # regularization
     self.n_head = config.n_head
     self.n_embd = config.n_embd
-    # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
-    self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                   .view(1, 1, config.block_size, config.block_size))
+    ## not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+    # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+    #                .view(1, 1, config.block_size, config.block_size))
 
   def forward(self, x):
     """
@@ -363,7 +363,7 @@ if ddp:
   ddp_local_rank = int(os.environ['LOCAL_RANK'])  # 主机编号，不用
   ddp_world_size = int(os.environ['WORLD_SIZE'])  # 总卡的数量，一台主机即一台主机上卡的数量
   device = f'cuda:{ddp_local_rank}'
-  device_type = "cuda"
+
   torch.cuda.set_device(device)
   master_process = ddp_rank == 0 # 主进程负责日志、保存权重等
 else:
@@ -372,14 +372,14 @@ else:
   ddp_local_rank = 0
   ddp_world_size = 1
   master_process = True
-  device = "cpu"
   device_type = "cpu"
   if torch.cuda.is_available():
     device = "cuda"
-    device_type = "cuda"
   elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
   print(f"using device: {device}")
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 #@ 设置种子
 torch.manual_seed(1337)
@@ -444,7 +444,8 @@ def get_lr(it):
 
 #@ 创建优化器
 # optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(
+  weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 #@ log
 log_dir = "log"
@@ -459,7 +460,7 @@ for step in range(max_steps):
   t0 = time.time()
   last_step = (step == max_steps - 1)
   
-  #@ 验证
+  #@ 验证，保存权重
   if step % 250 == 0 or last_step:
     model.eval()
     val_loader.reset()
@@ -479,6 +480,16 @@ for step in range(max_steps):
       print(f"validation loss: {val_loss_accum.item():.4f}")
       with open(log_file, "a") as f:
         f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+      if step > 0 and (step % 5000 == 0 or last_step):
+        checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+        checkpoint = {
+          'model': raw_model.state_dict(),
+          'config': raw_model.config,
+          'step': step,
+          'val_loss': val_loss_accum.item()
+        }
+        # 这个只能做为权重保存，如果你要继续训练，还需要保存优化器的状态，随机种子
+        torch.save(checkpoint, checkpoint_path)
 
   #@ HellaSwag
   if (step % 250 == 0 or last_step) and (not use_compile):
@@ -548,15 +559,16 @@ for step in range(max_steps):
   for micro_step in range(grad_accum_steps):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
+    #fix 如果不需要梯度同步，则在前向传播和反向传播的时候 require_backward_grad_sync 都要为 False
+    # 为什么关闭梯度同步，只在最后一次同步，以及这里为什么fix，参考readme或笔记
+    if ddp: # 在最后一个micro_step的时候才运行需要梯度同步 # 非标准方式
+      model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
       logits, loss = model(x, y) # 计算出来的是micro_batch的loss
     # cross_entropy 默认reduction=mean，损失计算公式为sum L_i/B。
     # 梯度累积的情况下使用小批量B/gas，也就是sum L_per_micro*gas/B，还需要除以一个gas。
     loss /= grad_accum_steps
     loss_accum += loss.detach()
-    # 在最后一个micro_step的时候才运行backward计算；减少backward次数。因为backward会卡间通信，很慢；非标准方式
-    if ddp:
-      model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
     loss.backward()  #@ require_backward_grad_sync为true的时候会，会在多卡间同步梯度，默认做平均
   if ddp:  # 累加平均每个gpu上的loss
     dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
