@@ -14,23 +14,6 @@ from rich.traceback import install
 install()
 # -------------------------------------------------------------------------------------------------
 
-# timer 装饰器 -------------------------------------------------------------------------------------
-def timing_decorator(func):
-  import time
-  from functools import wraps  # 导入 wraps 装饰器
-  @wraps(func)  # 使用 wraps 装饰器来保留原始函数的元数据
-  def wrapper(*args, **kwargs):
-    start_time = time.time()  # 记录开始时间
-    result = func(*args, **kwargs)  # 执行被装饰的函数
-    end_time = time.time()  # 记录结束时间
-    execution_time = end_time - start_time  # 计算执行时间
-    BOLD, RESET, lightred = '\033[1m', '\033[0m', '\033[91m'  # ANSI 转义码来设置文本颜色
-    # 打印带有颜色和样式的运行时间
-    print(f"{lightred}{BOLD}[INFO] {func.__name__} executed in {execution_time:.4f}s{RESET} ")
-    return result
-  return wrapper
-# -------------------------------------------------------------------------------------------------
-
 #%1 -----------------------------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -282,7 +265,7 @@ class DataLoaderLite:
     
     data_root = "edu_fineweb10B"  #fix 硬编码
     shards = os.listdir(data_root)  # listdir获取路径下所有文件名、文件夹名
-    shards = [s for s in shards if split in s]  # 选择train或val数据的文件名
+    shards = [s for s in shards if split in s]  #$ 选择文件名含有"train"或"val"的数据^^
     shards = sorted(shards)   # 排序（文件名本身有序）
     shards = [os.path.join(data_root, s) for s in shards]  # 拼接为完整路径
     self.shards = shards
@@ -291,8 +274,12 @@ class DataLoaderLite:
     if master_process:  #fix master_process是下面的全局变量
       print(f"found {len(shards)} shards for split {split}")
     
+    self.reset()
+
+  def reset(self):
+    """重置数据加载器读取数据的位置"""
     self.current_shard = 0
-    self.tokens = load_tokens(shards[self.current_shard])  # tensor token 数据
+    self.tokens = load_tokens(self.shards[self.current_shard])  # tensor token 数据
     self.current_position = self.B * self.T * self.process_rank  # 当前设备（进程）的访问数据块的起始位置
     self.data_chunk_size = B * T * self.num_processes   # 全部设备（进程）的访问数据页大小；[块 块]=页
     
@@ -354,21 +341,25 @@ else:
 torch.manual_seed(1337)
 if torch.cuda.is_available():
   torch.cuda.manual_seed(1337)
+  
+enc = tiktoken.get_encoding('gpt2')
 
 #@ 设置批量大小
 total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
-B = 4 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
+B = 8 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, \
   "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)  #! 小心计算
 if master_process:
+  print(f"B={B}, T={T}")
   print(f"total desired batch size: {total_batch_size}")
   print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-
 train_loader = DataLoaderLite(
   B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(
+  B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 # print(f"with grad accum 1 epoch = {len(train_loader.tokens) // (B * T * grad_accum_steps)} batches")
 # 整个 tinyShakespeare 一共 338025 个token。 524288>338025
 torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
@@ -376,7 +367,9 @@ torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
 #@ 创建模型
 model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
 model.to(device)
-model.compile()  #@ 编译模型
+use_compile = False
+if use_compile:
+  model.compile()  #@ 编译模型
 if ddp:
   model = DDP(model, device_ids=[ddp_local_rank])  # 模型->DDP模型
 raw_model = model.module if ddp else model  # 需要在模型本体上设置优化器参数
@@ -407,11 +400,62 @@ def get_lr(it):
   coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
   # 系数从1衰减到0，因此最终学习率将从最大值衰减到最小值
   return min_lr + coeff * (max_lr - min_lr)
-  
-#@ 训练
+
+#@ 训练流程
 t_st = time.time()
 for step in range(max_steps):
   t0 = time.time()
+  
+  #@ 验证
+  if step % 5 == 0:
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+      val_loss_accum = 0.0
+      val_loss_steps = 20
+      for _ in range(val_loss_steps):
+        x, y = val_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+          logits, loss = model(x, y)
+        loss = loss / val_loss_steps  # 不需要loss.backward()
+        val_loss_accum += loss.detach()
+    if ddp:
+      dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    if master_process:
+      print(f"validation loss: {val_loss_accum.item():.4f}")
+
+  #@ 生成文本，模型如果compile了那么这里会报错
+  if step > 0 and step % 5 == 0 and not use_compile:
+    model.eval()
+    num_return_sequences = 4
+    max_length = 32  # 生成token的最大数量
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num, 8)
+    xgen = tokens.to(device)
+    sample_rng = torch.Generator(device=device)  # 随机数生成器，防止下面的操作打乱了随机顺序
+    sample_rng.manual_seed(42 + ddp_rank)
+    while xgen.size(1) < max_length:
+      with torch.no_grad():
+        logits, loss = model(xgen) # (B, T, vocab_size)
+        logits = logits[:, -1, :] # (B, vocab_size) # 取最后一个位置的 logits
+        probs = F.softmax(logits, dim=-1) # (B, vocab_size) # softmax获取概率
+        # 进行 top-k 采样，k=50（Hugging Face pipeline 的默认值）
+        # topk_probs (4, 50)，为值 ，topk_indices (4, 50)，为索引
+        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
+        # 从 top-k 概率中选择一个 token； 注意：multinomial 不要求输入的概率和为 1
+        ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng) # (B, 1)
+        # 收集对应的索引
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # 将其附加到序列中
+        xgen = torch.cat((xgen, xcol), dim=1)
+    for i in range(num_return_sequences): # 逐行打印
+      tokens = xgen[i, :max_length].tolist()
+      decoded = enc.decode(tokens) 
+      print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+  #@ 训练
   optimizer.zero_grad()
   loss_accum = 0.0
   for micro_step in range(grad_accum_steps):
@@ -426,19 +470,20 @@ for step in range(max_steps):
     # 在最后一个micro_step的时候才运行backward计算；减少backward次数。因为backward会卡间通信，很慢；非标准方式
     if ddp:
       model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
-    loss.backward()  #？ 梯度计算，会让所有的卡都算，然后共享？
+    loss.backward()  #@ require_backward_grad_sync为true的时候会，会在多卡间同步梯度，默认做平均
   if ddp:  # 累加平均每个gpu上的loss
     dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-  # 控制全梯度L2范数不超过1.0；返回原始全梯度的L2范数
-  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+  ##$ 使用等比缩放，控制全梯度L2范数不超过1.0（hack trick）；返回原始全梯度的L2范数
+  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 控制梯度最重要的目的是防止梯度爆炸
   lr = get_lr(step)  # 获取学习率
   for param_group in optimizer.param_groups:  # 需手动更新每一个参数组的学习率
     param_group['lr'] = lr 
   optimizer.step()
+  # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   if device_type == "cuda":
     for i in range(torch.cuda.device_count()):
       torch.cuda.synchronize(i)
-    # torch.cuda.synchronize(device) # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
+    # torch.cuda.synchronize(device) 
   t1 = time.time()
   dt = t1 - t0
   tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size # 524288
@@ -463,11 +508,7 @@ model.eval()
 num_return_sequences = 5
 max_length = 30
 
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
+
 
 # generate! right now x is (B, T) where B = 5, T = 8
 # set the seed to 42
