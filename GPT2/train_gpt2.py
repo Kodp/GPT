@@ -7,6 +7,8 @@ from turtle import back
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.cuda.amp import autocast, GradScaler
+
 
 # 美化错误输出 ------------------------------------------------------------------------------------
 import inspect
@@ -225,7 +227,7 @@ class GPT(nn.Module):
     # 检查能否使用fused版本的AdamW优化器并尝试使用 （fused指的是kernel融合，提高计算性能）
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and device_type == "cuda" # fused只支持cuda
-    use_fused=False
+    # use_fused=False
     if master_process:
       print(f"using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(
@@ -259,7 +261,7 @@ class DataLoaderLite:
     assert split in {'train', 'val'}  # train or val
     
     # 加载数据到内存（之后要改数据）
-    # with open('input.txt', 'r') as f:
+    #  open('input.txt', 'r') as f:
     #   text = f.read()
     # enc = tiktoken.get_encoding('gpt2')
     # tokens = enc.encode(text)
@@ -390,7 +392,7 @@ enc = tiktoken.get_encoding('gpt2')
 
 #@ 设置批量大小
 total_batch_size = 524288 # 2^19, ~0.5M, 单位是token的数量
-B = 4 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
+B = 16 # mirco batch size， 多个微批组成一批，因为要累积梯度 (作者的B用的是16)
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, \
   "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -406,7 +408,7 @@ val_loader = DataLoaderLite(
   B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 # print(f"with grad accum 1 epoch = {len(train_loader.tokens) // (B * T * grad_accum_steps)} batches")
 # 整个 tinyShakespeare 一共 338025 个token。 524288>338025
-torch.set_float32_matmul_precision('high')  #@ 设置使用 tf32
+# torch.set_float32_matmul_precision('')  #@ 设置使用 tf32
 
 #@ 创建模型
 model = GPT(GPTConfig(vocab_size=50304))  # 50304=2^7*393，能被许多2的幂整除，性能会更好
@@ -446,7 +448,7 @@ def get_lr(it):
 # optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(
   weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-
+scaler = GradScaler()
 #@ log
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
@@ -470,7 +472,7 @@ for step in range(max_steps):
       for _ in range(val_loss_steps):
         x, y = val_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
           logits, loss = model(x, y)
         loss = loss / val_loss_steps  # 不需要loss.backward()
         val_loss_accum += loss.detach()
@@ -501,7 +503,7 @@ for step in range(max_steps):
       tokens = tokens.to(device)
       mask = mask.to(device)
       with torch.no_grad():
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
           logits, loss = model(tokens)  # 获取模型输出
         pred_norm = get_most_likely_row(tokens, mask, logits)
       num_total += 1
@@ -535,7 +537,7 @@ for step in range(max_steps):
     sample_rng.manual_seed(42 + ddp_rank)
     while xgen.size(1) < max_length:
       with torch.no_grad():
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device, dtype=torch.bfloat16):
           logits, loss = model(xgen) # (B, T, vocab_size)
         logits = logits[:, -1, :] # (B, vocab_size) # 取最后一个位置的 logits
         probs = F.softmax(logits, dim=-1) # (B, vocab_size) # softmax获取概率
@@ -563,21 +565,25 @@ for step in range(max_steps):
     # 为什么关闭梯度同步，只在最后一次同步，以及这里为什么fix，参考readme或笔记
     if ddp: # 在最后一个micro_step的时候才运行需要梯度同步 # 非标准方式
       model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
       logits, loss = model(x, y) # 计算出来的是micro_batch的loss
     # cross_entropy 默认reduction=mean，损失计算公式为sum L_i/B。
     # 梯度累积的情况下使用小批量B/gas，也就是sum L_per_micro*gas/B，还需要除以一个gas。
     loss /= grad_accum_steps
     loss_accum += loss.detach()
-    loss.backward()  #@ require_backward_grad_sync为true的时候会，会在多卡间同步梯度，默认做平均
+    # loss.backward()  #@ require_backward_grad_sync为true的时候会，会在多卡间同步梯度，默认做平均
+    scaler.scale(loss).backward()
   if ddp:  # 累加平均每个gpu上的loss
     dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
   ##$ 使用等比缩放，控制全梯度L2范数不超过1.0（hack trick）；返回原始全梯度的L2范数
+  scaler.unscale_(optimizer)  # 反缩放梯度
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 控制梯度最重要的目的是防止梯度爆炸
   lr = get_lr(step)  # 获取学习率
   for param_group in optimizer.param_groups:  # 需手动更新每一个参数组的学习率
     param_group['lr'] = lr 
-  optimizer.step()
+  # optimizer.step()
+  scaler.step(optimizer)
+  scaler.update()
   # cpu给gpu发指令，很快就会运行到下面，但此时gpu还没有执行完。于是手动等待同步
   if device_type == "cuda":
     for i in range(torch.cuda.device_count()):
