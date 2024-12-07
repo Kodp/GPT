@@ -1,5 +1,36 @@
 # 复现GPT
 
+### `model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)`
+
+假设总批大小为 $N$。
+**梯度累积**是一种训练技巧，用于在内存受限的情况下扩大 batch size。基本思路是在多个 mini batch 上累积梯度，达到预定义的**梯度累积次数**再进行一次参数更新。使用梯度累积的等效批大小——总批大小 `total_batch_size = B * T * grad_accum_steps`。
+其中：
+- **B** 是每张 GPU 的 mini-batch 大小
+- **T** 是 GPU 的数量
+- **grad_accum_steps** 是梯度累积的步数
+单位是 token。
+
+- 单卡训练，总批大小为 $N$，一张卡一次算 $B$ 个数据，那么梯度累计次数就是 $N/B$；
+- 8 卡训练，总批大小为 $N$，一张卡一次算 $B$ 个数据，那么每张卡上梯度累积次数就是 $N/8B$。
+torch 使用 ddp model 后，每一次反向传播都会**自动同步梯度**——利用 all-reduce 操作让每一张 gpu上的梯度都是各 gpu 梯度的平均值，对于梯度累积来说是**不需要**的。而且梯度平均需要通信，通信的计算代价很高。我们只需要在每一张 gpu 在计算 $N/8B$ 数据后再同步。所以，代码只在累积到 `grad_accum_steps` 的最后一步时进行梯度同步和参数更新，前 `grad_accum_steps - 1` 步关闭梯度同步。
+
+
+`model.require_backward_grad_sync` 参数的作用是在多卡训练时，是否需要同步梯度。
+我们只希望在最后一个 `micro_step` 时同步梯度，而不是每个 `micro_step` 都同步梯度。因此，我们可以设置`model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)`，这样只在最后一个micro_step同步梯度（一个 `micro_step` 计算 `BxT` batch， `grad_accum_steps` 个 `micro_step` 组成一个 total_batch）。 
+
+奇怪的点在于 `require_backward_grad_sync` 也影响前向传播过程，如果要关闭梯度同步，必须在前向传播开始之前就把它设为 `False`。 所以我在代码里写了一个fix，这个就是提前设置 `require_backward_grad_sync` 的值。之前的代码是这个修改只在loss.backward前做，效果就不对。这个修改是视频放出来之后加的。参考 https://github.com/karpathy/build-nanogpt/pull/30 
+https://discuss.pytorch.org/t/whats-no-sync-exactly-do-in-ddp/170259/3
+
+```python
+# .. warning::
+# The forward pass should be included inside the context manager, or
+# else gradients will still be synchronized.
+```
+
+
+> 如果按照视频里的位置只在loss.backward之前做，那么大概第一个total_batch不会同步，之后每一个total_batch的第一轮做同步梯度。
+
+
 ### 加载一致性
 自己写模型并使用别的预训练模型加载时，需要保证自己写的模型和预训练模型保持一致，具体是两点：
 1. 架构， 即层的类型、顺序和参数（一般有通道数、卷积核大小、输入输出大小-也就是通道数）要一致。
@@ -60,3 +91,4 @@ D) He walks out of the store with the bottle of water.
 
 **参考：**
 [Andrej Karpathy](https://www.youtube.com/@AndrejKarpathy)
+
