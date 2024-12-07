@@ -420,7 +420,7 @@ def get_lr(it):
   """学习率调整"""
   # 1. 如果当前的训练步数（it）小于预热步数（warmup_steps），则进行线性预热
   if it < warmup_steps:
-    return max_lr + (it + 1) / warmup_steps
+    return max_lr * (it + 1) / warmup_steps
   # 2. 如果当前训练步数大于最大步数（max_steps），则直接返回最小学习率（min_lr）
   if it > max_steps:
     return min_lr
