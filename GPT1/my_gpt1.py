@@ -197,7 +197,7 @@ class GPTLanguageModel(nn.Module):
       logits = logits.view(B * T, C)
       targets = targets.view(B * T)
       loss = F.cross_entropy(logits, targets)
-
+    # 一般loss不在forward里面计算，而是在外部计算，这里为了方便
     return logits, loss
     
   def generate(self, idx, max_new_tokens):
