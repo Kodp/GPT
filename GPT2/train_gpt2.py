@@ -8,12 +8,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# 美化错误输出 ------------------------------------------------------------------------------------
-import inspect
-from rich.traceback import install
-
 from hellaswag import render_example, iterate_examples
-install()
+
+# 美化错误输出 ------------------------------------------------------------------------------------
+from rich.traceback import install; install()
 # -----------------------------------------------------------------------------------------------
 
 #%1 -----------------------------------------------------------------------------------------------
@@ -525,11 +523,11 @@ for step in range(max_steps):
   # 模型如果compile了那么这里会报错，因为compile后模型输入输出被固定，而生成时长度会有变化
   if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
     model.eval()
-    num_return_sequences = 4
+    B_sequences = 4  #$ 一次计算一批序列
     max_length = 32  # 生成token的最大数量
     tokens = enc.encode("Hello, I'm a language model,")
     tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num, 8)
+    tokens = tokens.unsqueeze(0).repeat(B_sequences, 1) # (num, 8)
     xgen = tokens.to(device)
     sample_rng = torch.Generator(device=device)  # 随机数生成器，防止下面的操作打乱了随机顺序
     sample_rng.manual_seed(42 + ddp_rank)
@@ -540,15 +538,15 @@ for step in range(max_steps):
         logits = logits[:, -1, :] # (B, vocab_size) # 取最后一个位置的 logits
         probs = F.softmax(logits, dim=-1) # (B, vocab_size) # softmax获取概率
         # 进行 top-k 采样，k=50（Hugging Face pipeline 的默认值）
-        # topk_probs (4, 50)，为值 ，topk_indices (4, 50)，为索引
+        # topk_probs (B_sequences, 50)，为值 ，topk_indices (4, 50)，为索引
         topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
-        # 从 top-k 概率中选择一个 token； 注意：multinomial 不要求输入的概率和为 1
+        # 从top-k的选择中采样num_samples个token； multinomial 不要求输入的概率和为 1
         ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng) # (B, 1)
         # 收集对应的索引
         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
         # 将其附加到序列中
         xgen = torch.cat((xgen, xcol), dim=1)
-    for i in range(num_return_sequences): # 逐行打印
+    for i in range(B_sequences): # 逐行打印
       tokens = xgen[i, :max_length].tolist() #? :max_length多此一举？
       decoded = enc.decode(tokens) 
       print(f"rank {ddp_rank} sample {i}: {decoded}")
