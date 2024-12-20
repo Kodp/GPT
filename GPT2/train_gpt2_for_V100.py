@@ -1,5 +1,5 @@
 #
-#! 由分支 git checkout adapt-v100 管理， train_gpt2.py。此为分支备份，不一定是最新！
+#! scaler 使用参考 https://pytorch.org/docs/stable/notes/amp_examples.html 
 import os
 import math
 import time
@@ -9,7 +9,7 @@ from turtle import back
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 
 # 美化错误输出 ------------------------------------------------------------------------------------
@@ -474,7 +474,8 @@ for step in range(max_steps):
       for _ in range(val_loss_steps):
         x, y = val_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        # torch.autocast(device_type, dtype=torch.bfloat16)
+        with autocast(device_type, dtype=torch.float16):  # 进行混合精度 fp16
           logits, loss = model(x, y)
         loss = loss / val_loss_steps  # 不需要loss.backward()
         val_loss_accum += loss.detach()
@@ -505,7 +506,7 @@ for step in range(max_steps):
       tokens = tokens.to(device)
       mask = mask.to(device)
       with torch.no_grad():
-        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with autocast(device_type, dtype=torch.float16):  # 进行混合精度 
           logits, loss = model(tokens)  # 获取模型输出
         pred_norm = get_most_likely_row(tokens, mask, logits)
       num_total += 1
@@ -539,7 +540,7 @@ for step in range(max_steps):
     sample_rng.manual_seed(42 + ddp_rank)
     while xgen.size(1) < max_length:
       with torch.no_grad():
-        with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with autocast(device_type, torch.float16):  # 进行混合精度
           logits, loss = model(xgen) # (B, T, vocab_size)
         logits = logits[:, -1, :] # (B, vocab_size) # 取最后一个位置的 logits
         probs = F.softmax(logits, dim=-1) # (B, vocab_size) # softmax获取概率
@@ -567,7 +568,7 @@ for step in range(max_steps):
     # 为什么关闭梯度同步，只在最后一次同步，以及这里为什么fix，参考readme或笔记
     if ddp: # 在最后一个micro_step的时候才运行需要梯度同步 # 非标准方式
       model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
-    with autocast():  # 使用autocast进行混合精度 torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    with autocast(device_type, torch.float16):  # 进行混合精度
       logits, loss = model(x, y) # 计算出来的是micro_batch的loss
     # cross_entropy 默认reduction=mean，损失计算公式为sum L_i/B。
     # 梯度累积的情况下使用小批量B/gas，也就是sum L_per_micro*gas/B，还需要除以一个gas。
